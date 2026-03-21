@@ -1,0 +1,124 @@
+/**
+ * Supported payment protocols
+ */
+export type Protocol = 'x402' | 'mpp' | 'card';
+
+/**
+ * Supported blockchain networks (CAIP-2 format for EVM, string for others)
+ */
+export type Chain =
+  | 'base'
+  | 'base-sepolia'
+  | 'polygon'
+  | 'solana'
+  | `eip155:${number}`
+  | `solana:${string}`
+  | string;
+
+/**
+ * Result of a completed payment
+ */
+export interface PaymentResult {
+  protocol: Protocol;
+  amount: string;
+  currency: string;
+  transactionHash?: string;
+  /**
+   * Protocol-specific receipt data.
+   *
+   * - x402: `{ scheme: string; networkId: string; payload: string }` — the signed EIP-712 payment proof
+   * - mpp: `{ sessionId: string; invoice?: string }` — the MPP session receipt
+   * - card: `{ chargeId: string; last4: string }` — the card charge confirmation (future)
+   */
+  receipt?: unknown;
+  settledAt?: number;
+}
+
+/**
+ * Payment requirements extracted from a 402 response
+ */
+export interface PaymentRequirement {
+  protocol: Protocol;
+  amount: string;
+  currency: string;
+  recipient?: string;
+  chain?: Chain;
+  resource?: string;
+
+  // ── x402-specific fields ──────────────────────────────────────
+  /** x402: CAIP-2 network identifier (e.g. "eip155:8453") */
+  network?: string;
+  /** x402: Recipient wallet address */
+  payTo?: string;
+  /** x402: Payment scheme — "exact" or "attest" */
+  scheme?: string;
+  /** x402: Maximum amount the server will charge (may differ from `amount`) */
+  maxAmountRequired?: string;
+  /** x402: Token symbol (e.g. "USDC") */
+  asset?: string;
+
+  // ── MPP-specific fields ───────────────────────────────────────
+  /** MPP: Challenge identifier from the WWW-Authenticate header */
+  challengeId?: string;
+  /** MPP: Accepted payment methods (e.g. ["crypto", "card"]) */
+  paymentMethods?: string[];
+
+  // ── Raw data ──────────────────────────────────────────────────
+  /** Raw parsed data from the 402 response (protocol-specific shape) */
+  raw?: unknown;
+}
+
+/**
+ * Wallet configuration — how PayMux signs payments
+ */
+export interface WalletConfig {
+  /** Direct private key (hex string) */
+  privateKey?: `0x${string}`;
+
+  /** Privy embedded wallet */
+  privy?: {
+    walletId: string;
+  };
+
+  /** Coinbase Agentic Wallet */
+  coinbase?: {
+    agentWalletId: string;
+  };
+}
+
+/**
+ * Card configuration — for card-based payments (week 2+)
+ */
+export interface CardConfig {
+  stripe?: {
+    customerId: string;
+  };
+}
+
+/**
+ * Spending limits
+ */
+export interface SpendingLimits {
+  /** Maximum amount per single request (USD) */
+  perRequest?: number;
+  /** Maximum amount per session (USD) — week 2 */
+  perSession?: number;
+  /** Maximum amount per rolling 24-hour period (USD) */
+  perDay?: number;
+  /** Amount above which human approval is required (USD) — week 8 */
+  requireApproval?: number;
+}
+
+/**
+ * Charge options for server middleware
+ */
+export interface ChargeOptions {
+  /** Amount to charge in specified currency */
+  amount: number;
+  /** Currency code (default: 'USD') */
+  currency?: string;
+  /** Description shown to paying agent */
+  description?: string;
+  /** Maximum timeout for payment settlement (seconds) */
+  maxTimeoutSeconds?: number;
+}

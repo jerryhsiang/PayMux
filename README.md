@@ -2,9 +2,9 @@
 
 **The easiest way to make your API agent-payable.**
 
-One middleware. Every protocol. MPP, x402, and cards in 5 lines of code.
+One middleware. x402 payments in 5 lines of code. MPP coming in v0.2.0.
 
-> Stripe was 7 lines of JavaScript. What took weeks of bank negotiations, gateway contracts, and compliance paperwork became a 5-minute job. PayMux does the same for AI agent payments — what takes separate integrations for MPP, x402, ACP, and card rails becomes a single `fetch()`.
+> Stripe was 7 lines of JavaScript. What took weeks of bank negotiations, gateway contracts, and compliance paperwork became a 5-minute job. PayMux does the same for AI agent payments — what takes separate protocol integrations becomes a single `fetch()`.
 
 ---
 
@@ -14,12 +14,11 @@ One middleware. Every protocol. MPP, x402, and cards in 5 lines of code.
 import { PayMuxServer } from 'paymux/server';
 
 const payments = PayMuxServer.create({
-  accept: ['mpp', 'x402'],
-  mpp: { stripeSecretKey: process.env.STRIPE_KEY },
+  accept: ['x402'],
   x402: { recipient: '0x...', chain: 'base' },
 });
 
-// One line. Your API now accepts payments from any agent.
+// One line. Your API now accepts x402 payments from any agent.
 app.get('/api/data',
   payments.charge({ amount: 0.01, currency: 'USD' }),
   (req, res) => res.json({ data: '...' })
@@ -32,36 +31,31 @@ app.get('/api/data',
 import { PayMux } from 'paymux';
 
 const agent = PayMux.create({
-  wallet: { privy: { walletId: 'wlt_...' } },
-  card: { stripe: { customerId: 'cus_...' } },
+  wallet: { privateKey: '0x...' },
   limits: { perRequest: 1.00, perDay: 200.00 },
 });
 
-// Auto-detects protocol. Routes optimally. Handles 402 challenges.
+// Auto-detects x402 from 402 response. Pays. Returns data.
 const response = await agent.fetch('https://api.example.com/data');
 ```
-
-### Browse agent-payable APIs
-
-Discover 500+ agent-payable APIs in the **[PayMux Directory](#service-directory)** — quality-scored, spam-filtered, and protocol-mapped.
 
 ---
 
 ## The Problem
 
-AI agents need to pay for services. API developers need to get paid by agents. Three incompatible payment protocols are now live, and neither side has a simple solution:
+AI agents need to pay for services. API developers need to get paid by agents. Multiple incompatible payment protocols are now live:
 
-| Protocol | Backers | Model |
-|----------|---------|-------|
-| **MPP** | Stripe + Tempo + Paradigm | Session-based streaming payments |
-| **x402** | Coinbase + Cloudflare | Per-request HTTP 402 micropayments |
-| **ACP** | OpenAI + Stripe | E-commerce checkout |
+| Protocol | Backers | Model | Status |
+|----------|---------|-------|--------|
+| **x402** | Coinbase + Cloudflare | Per-request HTTP 402 micropayments | **Supported in v0.1.0** |
+| **MPP** | Stripe + Tempo + Paradigm | Session-based streaming payments | Coming in v0.2.0 |
+| **ACP** | OpenAI + Stripe | E-commerce checkout | Planned |
 
-**For agent developers:** You must integrate each protocol separately, manually detect which protocol a service accepts, and handle routing, signing, and settlement independently.
+**For agent developers:** Integrate each protocol separately, detect which protocol a service accepts, handle signing and settlement independently.
 
-**For API developers:** You must choose a single protocol, losing access to agents that use a different one. Adding billing infrastructure takes 500+ lines of Stripe code — or you lock into a marketplace that takes 25%.
+**For API developers:** Choose a single protocol (losing agents on other protocols), or build 500+ lines of billing infrastructure.
 
-**PayMux solves both sides.** Agent developers get a single `fetch()` that auto-detects and pays. API developers get a single middleware that accepts every protocol. The directory connects them.
+**PayMux simplifies both sides.** Agent developers get a single `fetch()`. API developers get a single middleware.
 
 ---
 
@@ -75,37 +69,30 @@ AI agents need to pay for services. API developers need to get paid by agents. T
 ┌──────────────────┐                     ┌──────────────────┐
 │  paymux/server   │                     │  paymux (client)  │
 │                  │                     │                   │
-│  payments.charge │    ┌──────────┐     │  agent.fetch(url) │
-│  ({ $0.01 })     │◄──►│DIRECTORY │◄───►│                   │
-│                  │    │          │     │  auto-detect →    │
-│  Accepts:        │───►│ quality  │     │  auto-pay →       │
-│  • MPP           │    │ scored   │     │  auto-retry →     │
-│  • x402          │    └──────────┘     │  return response  │
-│  • cards         │                     │                   │
+│  payments.charge │                     │  agent.fetch(url) │
+│  ({ $0.01 })     │                     │                   │
+│                  │                     │  auto-detect →    │
+│  Accepts:        │                     │  auto-pay →       │
+│  • x402          │                     │  auto-retry →     │
+│                  │                     │  return response  │
 └──────────────────┘                     └──────────────────┘
-        │                                          │
-        └──────► More APIs paid ◄──────────────────┘
-                 More agents install
-                 FLYWHEEL
 ```
 
 ### For agent developers
 
 1. Agent calls `agent.fetch(url)`
-2. PayMux sends the request
-3. If the service returns HTTP 402, PayMux parses the response to detect the protocol
-4. PayMux executes payment via MPP, x402, or card — whichever the service accepts
-5. PayMux retries the original request with payment proof attached
-6. Agent receives the response
+2. PayMux sends the request via `@x402/fetch`
+3. If non-402, returns the response immediately (1 HTTP call, zero overhead)
+4. If 402, `@x402/fetch` automatically signs a USDC payment and retries (2 HTTP calls total)
+5. Agent receives the response with data
 
 ### For API developers
 
 1. Add `payments.charge()` middleware to any route
-2. PayMux returns 402 with all supported protocols to any agent that requests it
-3. Agent pays via whichever protocol it supports
-4. PayMux verifies payment and lets the request through
-5. Settlement routes automatically to Stripe (MPP) or Coinbase (x402)
-6. Your API auto-registers in the PayMux directory
+2. PayMux returns 402 with x402 payment requirements
+3. Agent pays via x402 (on-chain USDC)
+4. PayMux verifies payment via the x402 facilitator
+5. PayMux settles on-chain and lets the request through
 
 ---
 
@@ -113,44 +100,31 @@ AI agents need to pay for services. API developers need to get paid by agents. T
 
 ### Server Middleware (for API developers)
 
-- **Accept all protocols** -- single middleware to accept MPP, x402, and card payments
-- **5 lines of code** -- works with Express, Hono, Next.js, and Cloudflare Workers
-- **Settlement routing** -- automatically routes to Stripe (MPP) or Coinbase facilitator (x402)
-- **Per-request and session-based pricing** -- charge per API call or per second of compute
-- **Auto-registration** -- your API is automatically listed in the PayMux directory
-- **Revenue dashboard** -- see how much your API earns, which agents use it, protocol breakdown
-- **Deploy templates** -- one-click deploy to Cloudflare Workers or Vercel
+- **Accept x402 payments** -- single middleware to accept USDC micropayments
+- **5 lines of code** -- works with Express, Hono, and Cloudflare Workers
+- **Settlement routing** -- verifies and settles via the x402 facilitator
+- **Per-request pricing** -- charge per API call
+- **Deploy templates** -- Cloudflare Workers template included
 
 ### Client SDK (for agent developers)
 
-- **Unified `fetch()`** -- one call handles MPP, x402, ACP, and card payments
-- **Auto protocol detection** -- parses 402 response headers to identify the payment protocol
-- **Spending controls** -- per-request, per-session, and per-day limits with optional human-in-the-loop approval
-- **Multi-wallet support** -- Privy, Coinbase Agent Wallets, or direct private keys
-- **Session management** -- open long-running payment sessions with budget caps
-- **Cross-protocol analytics** -- track spending across all payment rails
-
-### Service Directory
-
-- **Protocol discovery** -- query which protocols any service supports
-- **Quality scoring** -- uptime, fidelity, and fraud detection scores
-- **Spam filtering** -- filters out low-quality and fake endpoints
-- **Auto-populated** -- services using paymux/server are automatically indexed
+- **Unified `fetch()`** -- auto-detects x402 from 402 responses and pays
+- **Spending controls** -- per-request and per-day limits with concurrency safety
+- **EVM wallet support** -- private key-based signing for Base, Polygon, Ethereum
+- **Debug mode** -- `debug: true` for full payment flow logging
 
 ---
 
-## API
+## Supported Chains
 
-```
-POST /v1/payments              Route a payment across protocols
-POST /v1/sessions              Open a payment session
-GET  /v1/services/{domain}     Query protocol support for a service
-GET  /v1/directory              Browse the service directory
-GET  /v1/directory/search       Search by category
-GET  /v1/spending/{agent_id}   Cross-protocol spending analytics
-GET  /v1/routing/optimal       Get optimal payment route
-GET  /v1/rates                 Real-time settlement cost comparison
-```
+| Chain | Network ID | Status |
+|-------|-----------|--------|
+| Base | eip155:8453 | Mainnet |
+| Base Sepolia | eip155:84532 | Testnet |
+| Polygon | eip155:137 | Mainnet |
+| Ethereum | eip155:1 | Mainnet |
+
+All chains use USDC with correct contract addresses.
 
 ---
 
@@ -158,28 +132,22 @@ GET  /v1/rates                 Real-time settlement cost comparison
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│                        PAYMUX                                │
+│                        PAYMUX v0.1.0                         │
 │                                                              │
 │  ┌────────────────────┐          ┌────────────────────────┐  │
 │  │  paymux (client)   │          │  paymux/server         │  │
 │  │                    │          │                        │  │
-│  │  Protocol Detector │          │  Multi-protocol 402    │  │
-│  │  MPP Client (mppx) │          │  Settlement Router     │  │
-│  │  x402 Client       │          │  Auto-registration     │  │
-│  │  Card Client       │◄────────►│  Revenue Tracking      │  │
-│  │  Spending Enforcer │          │                        │  │
-│  │  Session Manager   │          │  Express / Hono /      │  │
-│  │  Analytics         │          │  Next.js / CF Workers  │  │
+│  │  Protocol Detector │          │  x402 402 Response     │  │
+│  │  x402 Client       │          │  Payment Verification  │  │
+│  │  Spending Enforcer │◄────────►│  Settlement Router     │  │
+│  │                    │          │                        │  │
+│  │  (MPP: v0.2.0)     │          │  Express / Hono /      │  │
+│  │  (Card: future)    │          │  CF Workers            │  │
 │  └────────────────────┘          └────────────────────────┘  │
-│                    │                        │                 │
-│              ┌─────┴────────────────────────┴──────┐         │
-│              │         SERVICE DIRECTORY            │         │
-│              │  Discovery · Quality · Spam Filter   │         │
-│              └─────────────────────────────────────┘         │
 ├──────────────────────────────────────────────────────────────┤
-│  Protocols: MPP | x402 | ACP | Card                          │
+│  Protocol: x402 (v0.1.0) | MPP (v0.2.0) | Card (future)     │
 ├──────────────────────────────────────────────────────────────┤
-│  Rails: Tempo | Base/Polygon/Solana | Visa/MC                │
+│  Rails: Base / Polygon / Ethereum (USDC)                     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -189,33 +157,36 @@ GET  /v1/rates                 Real-time settlement cost comparison
 
 | Layer | Technology |
 |-------|-----------|
-| Runtime | Node.js / TypeScript |
-| Protocols | `mppx`, `@x402/fetch`, `@x402/express`, `@coinbase/x402` |
-| Frameworks | Express, Hono, Next.js, Cloudflare Workers |
-| Database | PostgreSQL (directory, quality scores, analytics) |
-| Cache | Redis (capability cache, rate limiting) |
-| Deployment | Cloudflare Workers (edge) + Railway (API/DB) |
+| Runtime | Node.js >= 18 / TypeScript |
+| x402 | `@x402/fetch`, `@x402/core`, `@x402/evm` |
+| Signing | `viem` |
+| Frameworks | Express, Hono, Cloudflare Workers |
 
 ---
 
 ## Roadmap
 
 - [x] Market analysis and architecture design
-- [ ] Client SDK -- unified `fetch()` with MPP + x402 auto-detection
-- [ ] Server middleware -- accept all protocols with one integration
-- [ ] Service directory with quality scoring and spam filtering
-- [ ] Spending controls and cross-protocol analytics
+- [x] Client SDK -- `agent.fetch()` with x402 auto-detection and payment
+- [x] Server middleware -- accept x402 payments with one line
+- [x] Spending controls (per-request, per-day limits)
+- [x] Cloudflare Workers deploy template
+- [ ] **v0.2.0** -- MPP protocol support (Stripe/Tempo)
+- [ ] Service directory with quality scoring
 - [ ] MCP integration for agent tool discovery
+- [ ] Card payments via Visa TAP + mpp-card
 - [ ] Python SDK
 
 ---
 
 ## Status
 
-Early development. The protocols are live -- MPP launched March 18, 2026 with 100+ services, x402 has been live since May 2025. The routing layer that unifies them does not exist yet. We're building it.
+**v0.1.0** -- x402 protocol support on both client and server. Spending controls with concurrency safety. Express, Hono, and Cloudflare Workers middleware.
+
+MPP (Stripe/Tempo) support ships in v0.2.0.
 
 ---
 
 ## License
 
-Proprietary. All rights reserved.
+MIT License. See [LICENSE](./LICENSE).

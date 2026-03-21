@@ -1,0 +1,10 @@
+name = "my-paid-api"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+# Set your wallet address to receive payments
+RECIPIENT_ADDRESS = "0xYourWalletAddress"
+# Chain to settle on (base, base-sepolia, polygon, etc.)
+CHAIN = "base-sepolia"
