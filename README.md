@@ -1,5 +1,7 @@
 # PayMux
 
+> Stripe was 7 lines of JavaScript. What took weeks of bank negotiations, gateway contracts, and compliance paperwork became a 5-minute job. PayMux does the same for AI agent payments — what takes separate integrations for MPP, x402, ACP, and card rails becomes a single `fetch()`.
+
 **Multi-protocol payment routing SDK for AI agents.**
 
 One SDK. Any payment protocol. Any rail.
