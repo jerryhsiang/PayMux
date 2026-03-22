@@ -62,39 +62,143 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 
 ## How It Works
 
+### x402 Payment Flow
+
 ```
-   API DEVELOPER                              AGENT DEVELOPER
-        │                                          │
-        │  npm i paymux                            │  npm i paymux
-        ▼                                          ▼
-┌──────────────────┐                     ┌──────────────────┐
-│  paymux/server   │                     │  paymux (client)  │
-│                  │                     │                   │
-│  payments.charge │                     │  agent.fetch(url) │
-│  ({ $0.01 })     │                     │                   │
-│                  │                     │  auto-detect →    │
-│  Accepts:        │                     │  auto-pay →       │
-│  • x402          │                     │  auto-retry →     │
-│  • MPP           │                     │                   │
-│                  │                     │  return response  │
-└──────────────────┘                     └──────────────────┘
+  AI Agent                 PayMux Client            Paid API                  PayMux Server           x402 Facilitator
+     │                         │                       │                         │                         │
+     │  agent.fetch(url)       │                       │                         │                         │
+     │────────────────────────>│                       │                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  1. GET /api/data     │                         │                         │
+     │                         │──────────────────────>│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │                       │  payments.charge()      │                         │
+     │                         │                       │────────────────────────>│                         │
+     │                         │                       │                         │                         │
+     │                         │  2. 402 Payment Required                       │                         │
+     │                         │  PAYMENT-REQUIRED: base64({                    │                         │
+     │                         │    x402Version: 2,                             │                         │
+     │                         │    accepts: [{                                 │                         │
+     │                         │      scheme: "exact",                          │                         │
+     │                         │      network: "eip155:8453",                   │                         │
+     │                         │      maxAmountRequired: "10000",               │                         │
+     │                         │      payTo: "0x...",                           │                         │
+     │                         │      asset: "0x833589f..."                     │                         │
+     │                         │    }]                                          │                         │
+     │                         │  })                                            │                         │
+     │                         │<─────────────────────│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  3. Check spending limits                      │                         │
+     │                         │  ✓ perRequest: $0.01 < $1.00 limit             │                         │
+     │                         │  ✓ perDay: $0.01 < $200.00 remaining           │                         │
+     │                         │                       │                         │                         │
+     │                         │  4. Sign USDC payment on-chain                 │                         │
+     │                         │  (via @x402/fetch + viem)                      │                         │
+     │                         │                       │                         │                         │
+     │                         │  5. GET /api/data     │                         │                         │
+     │                         │  PAYMENT-SIGNATURE: base64(signed_payment)     │                         │
+     │                         │──────────────────────>│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │                       │  Verify payment         │                         │
+     │                         │                       │────────────────────────>│                         │
+     │                         │                       │                         │  POST /verify            │
+     │                         │                       │                         │────────────────────────>│
+     │                         │                       │                         │  { isValid: true }       │
+     │                         │                       │                         │<────────────────────────│
+     │                         │                       │                         │                         │
+     │                         │                       │                         │  POST /settle            │
+     │                         │                       │                         │────────────────────────>│
+     │                         │                       │                         │  { success: true,        │
+     │                         │                       │                         │    transaction: "0x..." } │
+     │                         │                       │                         │<────────────────────────│
+     │                         │                       │                         │                         │
+     │                         │  6. 200 OK            │                         │                         │
+     │                         │  Payment-Response: base64({success, tx})       │                         │
+     │                         │  Body: { data: "premium content" }             │                         │
+     │                         │<─────────────────────│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  7. Record payment in spending tracker         │                         │
+     │                         │  dailySpend += $0.01                           │                         │
+     │                         │                       │                         │                         │
+     │  response.json()        │                       │                         │                         │
+     │  { data: "premium" }    │                       │                         │                         │
+     │<────────────────────────│                       │                         │                         │
 ```
 
-### For agent developers
+### MPP Payment Flow
 
-1. Agent calls `agent.fetch(url)`
-2. PayMux auto-detects the payment protocol (x402 or MPP)
-3. If non-402, returns the response immediately (1 HTTP call, zero overhead)
-4. If 402, the appropriate protocol client signs payment and retries (2 HTTP calls total)
-5. Agent receives the response with data — same code for x402 and MPP endpoints
+```
+  AI Agent                 PayMux Client            Paid API                  PayMux Server           Tempo Chain
+     │                         │                       │                         │                         │
+     │  agent.fetch(url)       │                       │                         │                         │
+     │────────────────────────>│                       │                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  1. GET /api/data     │                         │                         │
+     │                         │──────────────────────>│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  2. 402 Payment Required                       │                         │
+     │                         │  WWW-Authenticate: Payment                     │                         │
+     │                         │    id="hmac_challenge",                        │                         │
+     │                         │    realm="paymux",                             │                         │
+     │                         │    method="tempo",                             │                         │
+     │                         │    intent="charge",                            │                         │
+     │                         │    request="base64url(amount, recipient)"      │                         │
+     │                         │<─────────────────────│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  3. Check spending limits                      │                         │
+     │                         │  ✓ perRequest / perDay checks                 │                         │
+     │                         │                       │                         │                         │
+     │                         │  4. Sign payment on Tempo                      │                         │
+     │                         │  (via mppx scoped fetch)       │               │                         │
+     │                         │                       │                         │                         │
+     │                         │  5. GET /api/data     │                         │                         │
+     │                         │  Authorization: Payment base64url(credential)  │                         │
+     │                         │──────────────────────>│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │                       │  Verify HMAC +          │                         │
+     │                         │                       │  credential             │                         │
+     │                         │                       │────────────────────────>│                         │
+     │                         │                       │                         │  Verify on-chain         │
+     │                         │                       │                         │────────────────────────>│
+     │                         │                       │                         │  ✓ Confirmed             │
+     │                         │                       │                         │<────────────────────────│
+     │                         │                       │                         │                         │
+     │                         │  6. 200 OK            │                         │                         │
+     │                         │  Payment-Receipt: base64url({                  │                         │
+     │                         │    status: "success",                          │                         │
+     │                         │    method: "tempo",                            │                         │
+     │                         │    reference: "0x...",                         │                         │
+     │                         │    timestamp: "2026-03-21T..."                 │                         │
+     │                         │  })                                            │                         │
+     │                         │  Body: { data: "premium content" }             │                         │
+     │                         │<─────────────────────│                         │                         │
+     │                         │                       │                         │                         │
+     │                         │  7. Record payment in spending tracker         │                         │
+     │                         │                       │                         │                         │
+     │  response.json()        │                       │                         │                         │
+     │  { data: "premium" }    │                       │                         │                         │
+     │<────────────────────────│                       │                         │                         │
+```
 
-### For API developers
+### Non-Payment Flow (Zero Overhead)
 
-1. Add `payments.charge()` middleware to any route
-2. PayMux returns 402 with payment requirements for all configured protocols
-3. Agent pays via whichever protocol it supports (x402 or MPP)
-4. PayMux verifies payment and settles
-5. Request proceeds — your handler runs, agent gets data
+```
+  AI Agent                 PayMux Client            Free API
+     │                         │                       │
+     │  agent.fetch(url)       │                       │
+     │────────────────────────>│                       │
+     │                         │  GET /api/free        │
+     │                         │──────────────────────>│
+     │                         │                       │
+     │                         │  200 OK               │
+     │                         │  { data: "free" }     │
+     │                         │<─────────────────────│
+     │                         │                       │
+     │  response.json()        │  (1 HTTP call,        │
+     │  { data: "free" }       │   no payment logic    │
+     │<────────────────────────│   executed)            │
+```
 
 ---
 
