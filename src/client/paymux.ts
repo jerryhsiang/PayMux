@@ -30,13 +30,20 @@ export class PayMux {
 /**
  * PayMux client instance — handles auto-detection, routing, and payment.
  *
- * Supports x402 and MPP protocols. Each protocol client uses a SCOPED fetch
- * (no globalThis.fetch patching) and handles the full 402 → pay → retry flow.
+ * Architecture: Probe-first for protocol detection + spending enforcement.
  *
- * Architecture:
- * - For known x402 endpoints: delegates to @x402/fetch (single-pass, 1-2 HTTP calls)
- * - For known MPP endpoints: delegates to mppx (single-pass, 1-2 HTTP calls)
- * - For unknown endpoints: probes first to detect protocol, then delegates
+ * Flow:
+ * 1. Send probe request (plain fetch)
+ * 2. If non-402, return immediately (1 HTTP call, zero overhead)
+ * 3. If 402, detect protocol + extract amount from response
+ * 4. Enforce spending limits (per-request, per-day, maxAmount)
+ * 5. Route to correct protocol client (x402 or MPP) — which makes its OWN
+ *    full request (the probe is not reused, because protocol clients handle
+ *    the entire 402 → pay → retry flow internally)
+ * 6. Total: 3 HTTP calls for paid requests (probe + client's 402 + paid retry)
+ *
+ * The probe adds 1 extra request vs. direct protocol routing, but it's required
+ * to enforce spending limits BEFORE payment (knowing the amount before signing).
  */
 export class PayMuxClient {
   private x402Client: X402Client | null = null;
@@ -64,14 +71,6 @@ export class PayMuxClient {
   /**
    * Fetch a resource, automatically handling payment if required.
    *
-   * Multi-protocol routing:
-   * 1. If user specifies a protocol, delegates directly to that client
-   * 2. Otherwise, tries x402 first (via @x402/fetch, handles 402 internally)
-   * 3. If x402 doesn't handle the 402, probes for MPP (WWW-Authenticate: Payment)
-   * 4. Routes to the appropriate protocol client
-   *
-   * Both x402 and MPP clients use scoped fetch — no globalThis patching.
-   *
    * @throws {SpendingLimitError} If payment exceeds configured limits
    * @throws {Error} If payment fails or no wallet configured
    */
@@ -89,115 +88,69 @@ export class PayMuxClient {
 
     this.log(`[paymux] [>] ${fetchInit.method ?? 'GET'} ${urlString}`);
 
-    // Pre-flight: check daily limit has remaining capacity
-    const stats = this.spendingEnforcer.stats();
-    if (stats.dailyRemaining !== undefined && stats.dailyRemaining <= 0) {
-      throw new Error(
-        `PayMux: Daily spending limit of $${stats.dailyLimit?.toFixed(2)} reached ` +
-          `(spent: $${stats.dailySpend.toFixed(2)})`
-      );
-    }
-
-    // If user specified a protocol, go directly to that client
-    if (protocol === 'mpp' && this.mppClient) {
-      return this.payViaClient(this.mppClient, urlString, fetchInit, maxAmount);
-    }
-    if (protocol === 'x402' && this.x402Client) {
-      return this.payViaClient(this.x402Client, urlString, fetchInit, maxAmount);
-    }
-
-    // Multi-protocol auto-detection
-    // Try x402 first (most common, @x402/fetch handles the flow)
-    if (this.x402Client) {
-      try {
-        const { response, result } = await this.x402Client.pay(urlString, fetchInit);
-
-        // If x402 handled it (paid or non-402), we're done
-        if (result.amount !== '0' || response.status !== 402) {
-          if (parseFloat(result.amount) > 0) {
-            this.recordPayment(result, maxAmount);
-          } else {
-            this.log(`[paymux] [<] ${response.status} (no payment required)`);
-          }
-          return response;
-        }
-      } catch {
-        // x402 couldn't handle it — fall through to MPP detection
-      }
-    }
-
-    // x402 didn't handle it. Probe for MPP or other protocols.
+    // Step 1: Probe request to detect if payment is needed + which protocol
     const probeResponse = await globalThis.fetch(urlString, fetchInit);
 
+    // Step 2: If not 402, return immediately (no payment needed)
     if (probeResponse.status !== 402) {
       this.log(`[paymux] [<] ${probeResponse.status} (no payment required)`);
       return probeResponse;
     }
 
-    // Detect protocol from 402 response
+    this.log(`[paymux] [<] 402 Payment Required — detecting protocol...`);
+
+    // Step 3: Detect protocol from 402 response headers/body
     const requirements = await detectProtocol(probeResponse);
+
     if (requirements.length === 0) {
-      this.log(`[paymux] [err] Could not detect payment protocol from 402 response`);
+      this.log(`[paymux] [err] Could not detect payment protocol`);
       return probeResponse;
     }
 
-    const requirement = selectBestRequirement(requirements);
+    // Select best payment method (respects preferProtocol config + forced protocol)
+    const requirement = selectBestRequirement(
+      requirements,
+      protocol ? [protocol] : this.config.preferProtocol
+    );
+
     if (!requirement) {
+      this.log(`[paymux] [err] No supported payment method found`);
       return probeResponse;
     }
 
-    this.log(`[paymux]   Detected: ${requirement.protocol}`);
+    const amount = parseFloat(requirement.amount);
+    this.log(
+      `[paymux]   Protocol: ${requirement.protocol} | Amount: ${amount} ${requirement.currency}`
+    );
 
-    // Route to MPP
-    if (requirement.protocol === 'mpp' && this.mppClient) {
-      return this.payViaClient(this.mppClient, urlString, fetchInit, maxAmount);
-    }
-
-    // No handler found
-    if (!this.x402Client && !this.mppClient) {
+    // Step 4: ENFORCE SPENDING LIMITS — before any payment is made
+    // maxAmount ceiling check
+    if (maxAmount !== undefined && amount > maxAmount) {
       throw new Error(
-        `PayMux: Server requires ${requirement.protocol} payment but no wallet is configured. ` +
-          'Pass wallet.privateKey to PayMux.create().'
+        `PayMux: Payment of $${amount.toFixed(2)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
       );
     }
 
-    this.log(`[paymux] [err] No client available for protocol: ${requirement.protocol}`);
-    return probeResponse;
-  }
+    // Per-request + per-day limits (reserves amount as pending)
+    this.spendingEnforcer.check(amount);
 
-  /**
-   * Pay via a specific protocol client
-   */
-  private async payViaClient(
-    client: X402Client | MppClient,
-    url: string,
-    init: RequestInit,
-    maxAmount?: number
-  ): Promise<Response> {
-    const { response, result } = await client.pay(url, init);
+    // Step 5: Route to protocol client — release pending on failure
+    let response: Response;
+    let result: PaymentResult;
 
-    if (parseFloat(result.amount) > 0) {
-      this.recordPayment(result, maxAmount);
-    } else {
-      this.log(`[paymux] [<] ${response.status} (no payment required)`);
+    try {
+      const payResult = await this.routeToClient(urlString, fetchInit, requirement);
+      response = payResult.response;
+      result = payResult.result;
+    } catch (error) {
+      // Release the pending reservation so failed payments don't
+      // permanently reduce daily spending capacity
+      this.spendingEnforcer.release(amount);
+      throw error;
     }
 
-    return response;
-  }
-
-  /**
-   * Record a successful payment in spending tracker
-   */
-  private recordPayment(result: PaymentResult, maxAmount?: number): void {
-    const paidAmount = parseFloat(result.amount);
-
-    if (maxAmount !== undefined && paidAmount > maxAmount) {
-      this.log(
-        `[paymux] [warn] Paid $${paidAmount.toFixed(2)} (exceeded maxAmount $${maxAmount.toFixed(2)}, already settled)`
-      );
-    }
-
-    this.spendingEnforcer.record(paidAmount);
+    // Step 6: Record successful payment (moves from pending to confirmed)
+    this.spendingEnforcer.record(amount);
     this.paymentHistory.push(result);
 
     if (this.paymentHistory.length > PayMuxClient.MAX_HISTORY) {
@@ -205,8 +158,55 @@ export class PayMuxClient {
     }
 
     this.log(
-      `[paymux] [ok] Paid ${result.amount} ${result.currency} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
+      `[paymux] [ok] Paid ${requirement.amount} ${requirement.currency} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
     );
+
+    return response;
+  }
+
+  /**
+   * Route to the correct protocol client based on detected requirement.
+   */
+  private async routeToClient(
+    url: string,
+    init: RequestInit,
+    requirement: PaymentRequirement
+  ): Promise<{ response: Response; result: PaymentResult }> {
+    switch (requirement.protocol) {
+      case 'x402': {
+        if (!this.x402Client) {
+          throw new Error(
+            'PayMux: x402 payment required but no wallet configured. ' +
+              'Pass wallet.privateKey to PayMux.create().'
+          );
+        }
+        if (!this.x402Client.canHandle(requirement)) {
+          throw new Error(
+            `PayMux: x402 cannot handle network "${requirement.network}". ` +
+              'Only EVM chains are currently supported.'
+          );
+        }
+        return this.x402Client.pay(url, init, requirement);
+      }
+
+      case 'mpp': {
+        if (!this.mppClient) {
+          throw new Error(
+            'PayMux: MPP payment required but no wallet configured. ' +
+              'Pass wallet.privateKey to PayMux.create().'
+          );
+        }
+        return this.mppClient.pay(url, init, requirement);
+      }
+
+      case 'card':
+        throw new Error(
+          'PayMux: Card payments ship in a future release. Use x402 or MPP for now.'
+        );
+
+      default:
+        throw new Error(`PayMux: Unknown protocol "${requirement.protocol}"`);
+    }
   }
 
   get spending() {
