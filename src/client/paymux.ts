@@ -34,17 +34,17 @@ export class PayMux {
  * Architecture: Probe-first for protocol detection + spending enforcement.
  *
  * Flow:
- * 1. Send probe request (plain fetch)
- * 2. If non-402, return immediately (1 HTTP call, zero overhead)
- * 3. If 402, detect protocol + extract amount from response
- * 4. Enforce spending limits (per-request, per-day, maxAmount)
- * 5. Route to correct protocol client (x402 or MPP) — which makes its OWN
- *    full request (the probe is not reused, because protocol clients handle
- *    the entire 402 → pay → retry flow internally)
- * 6. Total: 3 HTTP calls for paid requests (probe + client's 402 + paid retry)
+ * 1. Send probe request (plain fetch) — 1 HTTP call
+ * 2. If non-402, return immediately (zero overhead)
+ * 3. If 402, detect protocol + extract amount + convert to USD
+ * 4. Enforce spending limits (per-request, per-day, maxAmount) — all in USD
+ * 5. Sign payment locally (pure crypto, no HTTP call)
+ * 6. Retry with payment proof — 1 HTTP call
+ * 7. Total: 2 HTTP calls for paid requests (probe + paid retry)
  *
- * The probe adds 1 extra request vs. direct protocol routing, but it's required
- * to enforce spending limits BEFORE payment (knowing the amount before signing).
+ * For x402: signs directly from the probe's PAYMENT-REQUIRED header using
+ * @x402/core (bypasses wrapFetchWithPayment which would make a redundant request).
+ * For MPP: mppx.fetch() handles its own flow (probe is still useful for detection).
  */
 export class PayMuxClient {
   private x402Client: X402Client | null = null;
@@ -155,7 +155,7 @@ export class PayMuxClient {
     let result: PaymentResult;
 
     try {
-      const payResult = await this.routeToClient(urlString, fetchInit, requirement);
+      const payResult = await this.routeToClient(urlString, fetchInit, requirement, probeResponse);
       response = payResult.response;
       result = payResult.result;
     } catch (error) {
@@ -182,11 +182,14 @@ export class PayMuxClient {
 
   /**
    * Route to the correct protocol client based on detected requirement.
+   * Passes probeResponse so protocol clients can sign directly from it
+   * (avoiding a redundant second probe request).
    */
   private async routeToClient(
     url: string,
     init: RequestInit,
-    requirement: PaymentRequirement
+    requirement: PaymentRequirement,
+    probeResponse: Response
   ): Promise<{ response: Response; result: PaymentResult }> {
     switch (requirement.protocol) {
       case 'x402': {
@@ -202,7 +205,8 @@ export class PayMuxClient {
               'Only EVM chains are currently supported.'
           );
         }
-        return this.x402Client.pay(url, init, requirement);
+        // Pass probeResponse so x402 client signs from its headers (no extra request)
+        return this.x402Client.pay(url, init, requirement, probeResponse);
       }
 
       case 'mpp': {
