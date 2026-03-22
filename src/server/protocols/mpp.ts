@@ -24,12 +24,35 @@ interface MppxChargeResult {
   withReceipt?: <T>(response: T) => T;
 }
 
-let cachedMppx: MppxServerInstance | null = null;
-let cachedConfigKey: string | null = null;
+/** Per-config instance cache. Keyed by hashed config values, not raw secrets. */
+const instanceCache = new Map<string, MppxServerInstance>();
+
+const MIN_SECRET_KEY_LENGTH = 32;
+
+/**
+ * Fast, non-cryptographic hash for cache key differentiation.
+ * Uses FNV-1a (32-bit). This is NOT for security — the mppx instance holds
+ * the secret in memory regardless. We hash only to avoid keeping the raw
+ * secret key as a Map key string that could surface in heap dumps / debuggers.
+ *
+ * Works in Node, Deno, Bun, and Cloudflare Workers (no `crypto` import needed).
+ */
+function hashConfigKey(secretKey: string, recipient: string, testnet: string): string {
+  const input = `${secretKey}:${recipient}:${testnet}`;
+  let hash = 0x811c9dc5; // FNV offset basis
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    // FNV prime multiply — use Math.imul for correct 32-bit overflow
+    hash = Math.imul(hash, 0x01000193);
+  }
+  // Convert to unsigned 32-bit hex
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
 
 /**
  * Get or create the mppx server instance.
- * Cached per unique config to avoid re-initialization on every request.
+ * Cached per unique config so multiple PayMuxServer instances with different
+ * merchant configs can coexist without overwriting each other.
  */
 async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInstance> {
   if (!config.mpp) {
@@ -38,11 +61,23 @@ async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInst
     );
   }
 
-  // Cache key based on config values that affect initialization
-  const configKey = `${config.mpp.secretKey}:${config.mpp.tempoRecipient}:${config.mpp.testnet}`;
+  if (config.mpp.secretKey.length < MIN_SECRET_KEY_LENGTH) {
+    throw new Error(
+      `PayMux Server: MPP secretKey must be at least ${MIN_SECRET_KEY_LENGTH} characters. ` +
+        'Generate one with: crypto.randomBytes(32).toString(\'base64\')'
+    );
+  }
 
-  if (cachedMppx && cachedConfigKey === configKey) {
-    return cachedMppx;
+  // Hash the config values — avoids storing the raw secret as a cache key
+  const configKey = hashConfigKey(
+    config.mpp.secretKey,
+    config.mpp.tempoRecipient ?? '',
+    String(config.mpp.testnet ?? false),
+  );
+
+  const cached = instanceCache.get(configKey);
+  if (cached) {
+    return cached;
   }
 
   const { Mppx, tempo } = await import('mppx/server');
@@ -89,9 +124,9 @@ async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInst
     realm: config.mpp.realm ?? 'paymux',
   });
 
-  cachedMppx = mppx as unknown as MppxServerInstance;
-  cachedConfigKey = configKey;
-  return cachedMppx;
+  const instance = mppx as unknown as MppxServerInstance;
+  instanceCache.set(configKey, instance);
+  return instance;
 }
 
 /**

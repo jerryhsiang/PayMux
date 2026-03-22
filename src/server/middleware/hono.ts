@@ -26,6 +26,31 @@ export function createHonoCharge(
       const resource = c.req.url;
       const requirements = buildPaymentRequirements(config, chargeOpts, resource);
 
+      // If MPP is configured, delegate to mppx to generate the proper
+      // HMAC-bound WWW-Authenticate: Payment challenge header. mppx needs
+      // the actual request to produce the challenge — we can't pre-generate it.
+      if (config.accept.includes('mpp') && config.mpp) {
+        const mppResult = await handleMppRequest(c.req.raw, config, chargeOpts);
+
+        if (mppResult.handled && mppResult.status === 402 && mppResult.challengeResponse) {
+          // Clone the mppx challenge response so we can add x402 headers alongside it
+          const challengeHeaders = new Headers(mppResult.challengeResponse.headers);
+
+          // Include x402 PAYMENT-REQUIRED header alongside the MPP challenge
+          if (requirements.paymentRequired) {
+            challengeHeaders.set('Payment-Required', requirements.paymentRequired);
+          }
+
+          const body = await mppResult.challengeResponse.text();
+          return new Response(body, {
+            status: 402,
+            headers: challengeHeaders,
+          });
+        }
+      }
+
+      // Fallback: no MPP configured or MPP challenge generation failed.
+      // Return static 402 with whatever headers are available.
       c.status(402);
       if (requirements.paymentRequired) {
         c.header('Payment-Required', requirements.paymentRequired);

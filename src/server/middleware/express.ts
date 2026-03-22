@@ -29,12 +29,38 @@ export function createExpressCharge(
         const resource = `${req.protocol}://${req.get('host') ?? 'localhost'}${req.originalUrl}`;
         const requirements = buildPaymentRequirements(config, chargeOpts, resource);
 
+        // If MPP is configured, delegate to mppx to generate the proper
+        // HMAC-bound WWW-Authenticate: Payment challenge header. mppx needs
+        // the actual request to produce the challenge — we can't pre-generate it.
+        if (config.accept.includes('mpp') && config.mpp) {
+          const standardRequest = expressToRequest(req);
+          const mppResult = await handleMppRequest(standardRequest, config, chargeOpts);
+
+          if (mppResult.handled && mppResult.status === 402 && mppResult.challengeResponse) {
+            res.status(402);
+
+            // Include x402 PAYMENT-REQUIRED header alongside the MPP challenge
+            if (requirements.paymentRequired) {
+              res.setHeader('Payment-Required', requirements.paymentRequired);
+            }
+
+            // Copy all headers from the mppx challenge response (WWW-Authenticate, etc.)
+            mppResult.challengeResponse.headers.forEach((value, key) => {
+              res.setHeader(key, value);
+            });
+
+            const body = await mppResult.challengeResponse.text();
+            res.send(body);
+            return;
+          }
+        }
+
+        // Fallback: no MPP configured or MPP challenge generation failed.
+        // Return static 402 with whatever headers are available.
         res.status(402);
-        // x402 requirements in PAYMENT-REQUIRED header
         if (requirements.paymentRequired) {
           res.setHeader('Payment-Required', requirements.paymentRequired);
         }
-        // MPP requirements in WWW-Authenticate header
         if (requirements.wwwAuthenticate) {
           res.setHeader('WWW-Authenticate', requirements.wwwAuthenticate);
         }

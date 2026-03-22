@@ -91,18 +91,58 @@ describe('detectProtocol', () => {
   });
 
   describe('MPP detection', () => {
+    /**
+     * Helper to base64url-encode a JSON object (mimics real MPP request param).
+     * Uses base64url: replaces + with -, / with _, strips trailing =.
+     */
+    function toBase64url(obj: unknown): string {
+      const json = JSON.stringify(obj);
+      return btoa(json).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
     it('detects MPP from WWW-Authenticate: Payment header', async () => {
+      const requestPayload = { amount: '0.10', currency: 'USD', recipient: '0xABC' };
       const response = mock402({
-        'www-authenticate': 'Payment id="abc123", realm="my-api", method="tempo", intent="charge", request="eyJ0ZXN0IjoxfQ"',
+        'www-authenticate': `Payment id="abc123", realm="my-api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
       });
 
       const result = await detectProtocol(response);
       expect(result).toHaveLength(1);
       expect(result[0].protocol).toBe('mpp');
       expect(result[0].challengeId).toBe('abc123');
+      expect(result[0].amount).toBe('0.10');
+      expect(result[0].amountUsd).toBe(0.10);
     });
 
-    it('extracts amount from MPP challenge params', async () => {
+    it('extracts amount from base64url-encoded request param (CRITICAL: spending limits)', async () => {
+      const requestPayload = { amount: '100000', currency: 'USD' };
+      const response = mock402({
+        'www-authenticate': `Payment id="xyz", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
+      });
+
+      const result = await detectProtocol(response);
+      expect(result).toHaveLength(1);
+      expect(result[0].protocol).toBe('mpp');
+      expect(result[0].amount).toBe('100000');
+      expect(result[0].amountUsd).toBe(100000);
+      expect(result[0].currency).toBe('USD');
+    });
+
+    it('extracts amount and currency from request param with base64url padding', async () => {
+      // Use a payload that produces base64 requiring padding characters
+      const requestPayload = { amount: '0.05', currency: 'EUR' };
+      const response = mock402({
+        'www-authenticate': `Payment id="pad-test", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
+      });
+
+      const result = await detectProtocol(response);
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('0.05');
+      expect(result[0].amountUsd).toBe(0.05);
+      expect(result[0].currency).toBe('EUR');
+    });
+
+    it('falls back to top-level params when request param is absent', async () => {
       const response = mock402({
         'www-authenticate': 'Payment amount="0.05", currency="USD"',
       });
@@ -111,16 +151,43 @@ describe('detectProtocol', () => {
       expect(result).toHaveLength(1);
       expect(result[0].protocol).toBe('mpp');
       expect(result[0].amount).toBe('0.05');
+      expect(result[0].amountUsd).toBe(0.05);
       expect(result[0].currency).toBe('USD');
     });
 
-    it('defaults MPP amount to 0 and currency to USD', async () => {
+    it('falls back to top-level params when request param is malformed', async () => {
+      const response = mock402({
+        'www-authenticate': 'Payment id="bad", realm="api", request="not-valid-base64!!!", amount="1.50", currency="USD"',
+      });
+
+      const result = await detectProtocol(response);
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('1.50');
+      expect(result[0].amountUsd).toBe(1.50);
+      expect(result[0].currency).toBe('USD');
+    });
+
+    it('defaults MPP amount to 0 and currency to USD when no amount anywhere', async () => {
       const response = mock402({
         'www-authenticate': 'Payment realm="test"',
       });
 
       const result = await detectProtocol(response);
       expect(result[0].amount).toBe('0');
+      expect(result[0].amountUsd).toBe(0);
+      expect(result[0].currency).toBe('USD');
+    });
+
+    it('request param amount takes precedence over top-level amount', async () => {
+      // If both are present, the decoded request data should win
+      const requestPayload = { amount: '99.99', currency: 'USD' };
+      const response = mock402({
+        'www-authenticate': `Payment amount="0.01", currency="EUR", request="${toBase64url(requestPayload)}"`,
+      });
+
+      const result = await detectProtocol(response);
+      expect(result[0].amount).toBe('99.99');
+      expect(result[0].amountUsd).toBe(99.99);
       expect(result[0].currency).toBe('USD');
     });
   });

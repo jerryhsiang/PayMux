@@ -175,6 +175,14 @@ function parseX402V1(
  * The 402 response contains a WWW-Authenticate header with challenge params.
  * mppx handles the full challenge/response flow internally, so we just need
  * to detect that this IS an MPP challenge and extract basic info.
+ *
+ * Real MPP challenge format:
+ *   Payment id="abc", realm="api", method="tempo", intent="charge",
+ *     request="eyJhbW91bnQiOiIwLjA1IiwiY3VycmVuY3kiOiJVU0QiLC4uLn0"
+ *
+ * The `request` field is base64url-encoded JSON containing the actual
+ * payment details: { amount, currency, recipient, ... }.
+ * The amount is NOT a top-level param in the challenge header.
  */
 function parseMppChallenge(
   headerValue: string
@@ -185,7 +193,7 @@ function parseMppChallenge(
   }
 
   // Extract params from the challenge string
-  // Format: Payment realm="...", amount="0.01", currency="USD", ...
+  // Top-level params: id, realm, method, intent, request (base64url-encoded JSON)
   const params: Record<string, string> = {};
   const paramRegex = /(\w+)="([^"]*)"/g;
   let match;
@@ -193,14 +201,51 @@ function parseMppChallenge(
     params[match[1]] = match[2];
   }
 
+  // Decode the `request` param to extract the actual amount and currency.
+  // The request field is base64url-encoded JSON: { amount, currency, recipient, ... }
+  let requestData: Record<string, unknown> | undefined;
+  if (params.request) {
+    try {
+      requestData = JSON.parse(base64urlDecode(params.request));
+    } catch {
+      // Malformed request param — fall through to top-level params
+    }
+  }
+
+  // Amount priority: decoded request data > top-level params > '0'
+  const amount = String(requestData?.amount ?? params.amount ?? '0');
+  const currency = String(requestData?.currency ?? params.currency ?? 'USD');
+
+  // MPP amounts are in human-readable form (e.g., "0.05" = $0.05 USD),
+  // NOT in base units like x402. Parse directly to USD.
+  const parsed = parseFloat(amount);
+  const amountUsd = Number.isFinite(parsed) ? parsed : undefined;
+
   return {
     protocol: 'mpp',
-    amount: params.amount ?? '0',
-    currency: params.currency ?? 'USD',
+    amount,
+    currency,
+    amountUsd,
     challengeId: params.challenge ?? params.id ?? undefined,
     paymentMethods: params.methods?.split(',') ?? undefined,
-    raw: { header: headerValue, params },
+    raw: { header: headerValue, params, requestData },
   };
+}
+
+/**
+ * Decode a base64url-encoded string to UTF-8 text.
+ *
+ * base64url uses `-` instead of `+` and `_` instead of `/`, with no padding.
+ * This converts to standard base64 before decoding via atob().
+ */
+function base64urlDecode(input: string): string {
+  // Replace base64url characters with standard base64 equivalents
+  let base64 = input.replace(/-/g, '+').replace(/_/g, '/');
+  // Add padding if necessary
+  const pad = base64.length % 4;
+  if (pad === 2) base64 += '==';
+  else if (pad === 3) base64 += '=';
+  return atob(base64);
 }
 
 /**
