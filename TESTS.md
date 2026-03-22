@@ -1,6 +1,18 @@
 # PayMux Test Coverage
 
-## Current Status: 84 tests, 5 files, all passing
+## Current Status: 90 unit/e2e tests + 8 live blockchain tests
+
+### Unit + E2E (run in CI, free):
+```
+npm test        → 90 tests, 5 files, all passing
+```
+
+### Live blockchain tests (manual, costs real/testnet tokens):
+```
+npx vitest run src/__tests__/live/x402-testnet.test.ts    # Base Sepolia (free)
+npx vitest run src/__tests__/live/x402-mainnet.test.ts    # Base mainnet (costs USDC!)
+npx vitest run src/__tests__/live/mpp-testnet.test.ts     # Tempo testnet (free)
+```
 
 ```
 npm test

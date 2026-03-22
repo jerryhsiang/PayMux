@@ -3,7 +3,8 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
-.env.*
+.env.local
+!.env.example
 .DS_Store
 coverage/
 *.tgz
