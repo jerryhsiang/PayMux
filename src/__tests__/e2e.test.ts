@@ -339,3 +339,150 @@ describe('E2E: Debug logging shows payment flow', () => {
     expect(logs.some(l => l.includes('x402'))).toBe(true);   // Protocol detected
   });
 });
+
+// ─── Scenario 6: Hono server with x402 payments ─────────────────
+
+describe('E2E: Hono server with x402 payments', () => {
+  let serverUrl: string;
+  let closeServer: () => void;
+
+  beforeEach(async () => {
+    const app = new Hono();
+
+    const payments = PayMuxServer.create({
+      accept: ['x402'],
+      x402: {
+        recipient: '0x742d35Cc6634c0532925a3b844bC9e7595F8fE00',
+        chain: 'base',
+      },
+    });
+
+    // Free endpoint
+    app.get('/api/info', (c) => c.json({ name: 'Hono Test API' }));
+
+    // Paid endpoint — middleware as app.use() then app.get()
+    app.use('/api/premium', async (c, next) => {
+      const mw = payments.charge({ amount: 0.05, currency: 'USD', description: 'Premium data' });
+      return mw(c, next);
+    });
+    app.get('/api/premium', (c) => c.json({ data: 'hono premium content', tier: 'gold' }));
+
+    // Start Hono via Node.js http server
+    const server = http.createServer(async (req, res) => {
+      const url = `http://localhost${req.url}`;
+      const headers = new Headers();
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (typeof value === 'string') headers.set(key, value);
+      }
+      const request = new Request(url, { method: req.method, headers });
+      const response = await app.fetch(request);
+
+      res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
+      const body = await response.text();
+      res.end(body);
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const addr = server.address() as { port: number };
+    serverUrl = `http://localhost:${addr.port}`;
+    closeServer = () => server.close();
+  });
+
+  afterEach(() => closeServer());
+
+  it('free endpoint returns 200', async () => {
+    const response = await fetch(`${serverUrl}/api/info`);
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.name).toBe('Hono Test API');
+  });
+
+  it('paid endpoint returns 402 with correct x402 headers', async () => {
+    const response = await fetch(`${serverUrl}/api/premium`);
+    expect(response.status).toBe(402);
+
+    const paymentRequired = response.headers.get('payment-required');
+    expect(paymentRequired).toBeTruthy();
+
+    const decoded = JSON.parse(atob(paymentRequired!));
+    expect(decoded.x402Version).toBe(2);
+    expect(decoded.accepts).toHaveLength(1);
+    expect(decoded.accepts[0].network).toBe('eip155:8453'); // base mainnet
+    expect(decoded.accepts[0].payTo).toBe('0x742d35Cc6634c0532925a3b844bC9e7595F8fE00');
+    // 0.05 * 10^6 = 50000
+    expect(decoded.accepts[0].maxAmountRequired).toBe('50000');
+  });
+
+  it('agent detects x402 from Hono server 402 response', async () => {
+    const agent = PayMux.create({});
+    await expect(
+      agent.fetch(`${serverUrl}/api/premium`)
+    ).rejects.toThrow('no wallet');
+  });
+
+  it('agent spending limits enforced against Hono server', async () => {
+    const agent = PayMux.create({
+      wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+      limits: { perRequest: 0.01 }, // $0.01 limit, server charges $0.05 (50000 base units)
+    });
+
+    await expect(
+      agent.fetch(`${serverUrl}/api/premium`)
+    ).rejects.toThrow(SpendingLimitError);
+  });
+});
+
+// ─── Scenario 7: Dual-protocol server (x402 + MPP) ──────────────
+
+describe('E2E: Express server with dual-protocol (x402 + MPP)', () => {
+  let serverUrl: string;
+  let closeServer: () => void;
+
+  beforeEach(async () => {
+    const app = express();
+
+    const payments = PayMuxServer.create({
+      accept: ['x402', 'mpp'],
+      x402: {
+        recipient: '0x742d35Cc6634c0532925a3b844bC9e7595F8fE00',
+        chain: 'base-sepolia',
+      },
+      mpp: {
+        secretKey: 'test-secret-key-for-hmac-binding-32-bytes!!',
+        tempoRecipient: '0x742d35Cc6634c0532925a3b844bC9e7595F8fE00',
+        testnet: true,
+      },
+    });
+
+    app.get(
+      '/api/dual',
+      payments.charge({ amount: 0.02, currency: 'USD' }),
+      (_req, res) => res.json({ data: 'dual-protocol' })
+    );
+
+    const started = await startExpress(app);
+    serverUrl = started.url;
+    closeServer = started.close;
+  });
+
+  afterEach(() => closeServer());
+
+  it('402 response includes x402 PAYMENT-REQUIRED header', async () => {
+    const response = await fetch(`${serverUrl}/api/dual`);
+    expect(response.status).toBe(402);
+
+    const paymentRequired = response.headers.get('payment-required');
+    expect(paymentRequired).toBeTruthy();
+
+    const decoded = JSON.parse(atob(paymentRequired!));
+    expect(decoded.x402Version).toBe(2);
+    expect(decoded.accepts[0].maxAmountRequired).toBe('20000'); // 0.02 * 10^6
+  });
+
+  it('402 body lists both protocols', async () => {
+    const response = await fetch(`${serverUrl}/api/dual`);
+    const body = await response.json();
+    expect(body.protocols).toContain('x402');
+    expect(body.protocols).toContain('mpp');
+  });
+});
