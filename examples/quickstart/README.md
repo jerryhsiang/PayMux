@@ -1,0 +1,144 @@
+# PayMux Quickstart
+
+Make your first agent payment in 5 minutes.
+
+## Quick Demo (no wallet needed)
+
+```bash
+cd examples/quickstart
+npm install
+npm run demo
+```
+
+This runs a paid API and an agent in the same process, showing:
+- Free endpoints pass through with zero overhead
+- Paid endpoints return 402 with x402 payment requirements
+- PayMux auto-detects the protocol
+- Spending limits block overspend before payment
+- Clear error messages at every step
+
+## Full Demo (with testnet payments)
+
+### 1. Get testnet USDC
+
+You need a wallet with USDC on Base Sepolia (free testnet tokens):
+
+1. **Create a wallet** — MetaMask, Coinbase Wallet, or any EVM wallet
+2. **Get Base Sepolia ETH** — [Coinbase Faucet](https://www.coinbase.com/faucets/base-ethereum-sepolia-faucet)
+3. **Get testnet USDC** — Bridge or faucet (check [Base Sepolia docs](https://docs.base.org/docs/tools/faucets))
+4. **Export your private key** — you'll need it for the agent
+
+### 2. Start the paid API server
+
+```bash
+cd examples/quickstart
+npm install
+npm run server
+```
+
+You'll see:
+```
+🚀 PayMux Quickstart Server running!
+
+   Free:  http://localhost:3000/api/time
+   Paid:  http://localhost:3000/api/joke  ($0.01)
+
+Try it:
+   curl http://localhost:3000/api/time     # Free — works
+   curl http://localhost:3000/api/joke     # Paid — returns 402
+```
+
+### 3. Run the paying agent
+
+In a new terminal:
+
+```bash
+PRIVATE_KEY=0xYourPrivateKey npm run agent
+```
+
+You'll see:
+```
+🤖 PayMux Agent starting...
+
+── Step 1: Fetching free endpoint ──
+[paymux] [>] GET http://localhost:3000/api/time
+[paymux] [<] 200 (no payment required)
+Result: { time: '2026-03-22T...' }
+Spending so far: $0.00
+
+── Step 2: Fetching paid endpoint ($0.01) ──
+[paymux] [>] GET http://localhost:3000/api/joke
+[paymux] [<] 402 Payment Required — detecting protocol...
+[paymux]   Protocol: x402 | Amount: $0.010000 (raw: 10000 0x036C...)
+[paymux] [ok] Paid $0.010000 via x402 | tx: 0x...
+Result: { joke: '...', price: '$0.01', paidVia: 'paymux x402' }
+Spending so far: $0.010000
+
+── Spending Summary ──
+  Total spent:     $0.010000
+  Daily remaining: $0.99
+  Payments made:   1
+  Last payment:    10000 USDC via x402
+  Transaction:     0x...
+```
+
+## How it works
+
+### Server side (5 lines)
+
+```typescript
+import { PayMuxServer } from 'paymux/server';
+
+const payments = PayMuxServer.create({
+  accept: ['x402'],
+  x402: { recipient: '0x...', chain: 'base-sepolia' },
+});
+
+app.get('/api/joke',
+  payments.charge({ amount: 0.01, currency: 'USD' }),
+  (req, res) => res.json({ joke: '...' })
+);
+```
+
+### Agent side (5 lines)
+
+```typescript
+import { PayMux } from 'paymux';
+
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  limits: { perRequest: 0.10, perDay: 1.00 },
+});
+
+const response = await agent.fetch('http://localhost:3000/api/joke');
+const data = await response.json(); // { joke: '...', price: '$0.01' }
+```
+
+## MPP Demo (Tempo testnet)
+
+For MPP payments via Stripe/Tempo:
+
+```bash
+# Install mppx CLI and create a testnet account (auto-funded)
+npm i -g mppx
+mppx account create
+
+# Use the account's private key
+PRIVATE_KEY=0x... npm run agent
+```
+
+Server config for MPP:
+
+```typescript
+const payments = PayMuxServer.create({
+  accept: ['x402', 'mpp'],
+  x402: { recipient: '0x...', chain: 'base-sepolia' },
+  mpp: {
+    secretKey: crypto.randomBytes(32).toString('base64'),
+    tempoRecipient: '0x...',
+    testnet: true,
+  },
+});
+```
+
+The agent code is identical — PayMux auto-detects the protocol.

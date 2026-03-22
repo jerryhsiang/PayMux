@@ -7,6 +7,7 @@ export default defineConfig({
     exclude: [
       'src/__tests__/live/**',
       'node_modules/**',
+      'examples/**',
     ],
   },
 });

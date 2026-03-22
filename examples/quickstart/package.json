@@ -1,0 +1,20 @@
+{
+  "name": "paymux-quickstart",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PayMux quickstart — make your first agent payment in 5 minutes",
+  "scripts": {
+    "server": "tsx server.ts",
+    "agent": "tsx agent.ts",
+    "demo": "tsx demo.ts"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "paymux": "file:../../"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "@types/express": "^4.17.21"
+  }
+}
