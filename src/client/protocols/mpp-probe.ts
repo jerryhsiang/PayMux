@@ -1,4 +1,4 @@
-import { mppAmountToUsd } from '../utils.js';
+import { mppAmountToUsd, base64urlDecode } from '../utils.js';
 
 /**
  * MPP probe -- fetch the 402 challenge to extract payment amount WITHOUT paying.
@@ -45,6 +45,19 @@ export async function probeMppAmount(
 ): Promise<MppProbeResult | null> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Merge the timeout signal with the caller's signal (if any).
+  // AbortSignal.any() is not available in Node 18, so we wire them manually.
+  const callerSignal = init?.signal;
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort(callerSignal.reason);
+    } else {
+      callerSignal.addEventListener('abort', () => {
+        controller.abort(callerSignal.reason);
+      }, { once: true });
+    }
+  }
 
   let response: Response;
   try {
@@ -115,13 +128,3 @@ export async function probeMppAmount(
   };
 }
 
-/**
- * Decode a base64url-encoded string to UTF-8 text.
- */
-function base64urlDecode(input: string): string {
-  let base64 = input.replace(/-/g, '+').replace(/_/g, '/');
-  const pad = base64.length % 4;
-  if (pad === 2) base64 += '==';
-  else if (pad === 3) base64 += '=';
-  return atob(base64);
-}

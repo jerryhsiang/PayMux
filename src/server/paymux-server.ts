@@ -1,6 +1,41 @@
 import type { PayMuxServerConfig, ChargeOptions, PayMuxMiddleware } from './types.js';
+import type { Chain } from '../shared/types.js';
 import { createExpressCharge } from './middleware/express.js';
 import { createHonoCharge } from './middleware/hono.js';
+
+/**
+ * Known named chains that PayMux supports.
+ * CAIP-2 format chains (eip155:*, solana:*) are also accepted.
+ */
+const VALID_NAMED_CHAINS = new Set<string>([
+  'base',
+  'base-sepolia',
+  'polygon',
+  'solana',
+]);
+
+/**
+ * Validate that a chain value is recognized.
+ * Accepts named chains (base, base-sepolia, polygon, solana) and
+ * CAIP-2 format chains (eip155:<number>, solana:<string>).
+ * Returns an error message if invalid, or null if valid.
+ */
+function validateChain(chain: Chain): string | null {
+  // Accept known named chains
+  if (VALID_NAMED_CHAINS.has(chain)) return null;
+
+  // Accept CAIP-2 EVM chains: eip155:<number>
+  if (/^eip155:\d+$/.test(chain)) return null;
+
+  // Accept CAIP-2 Solana chains: solana:<string>
+  if (/^solana:.+$/.test(chain)) return null;
+
+  const validList = [...VALID_NAMED_CHAINS].sort().join(', ');
+  return (
+    `PayMux Server: Unknown chain "${chain}". ` +
+    `Valid chains: ${validList}, or CAIP-2 format (eip155:<chainId>, solana:<cluster>)`
+  );
+}
 
 /** Common placeholder patterns that should be rejected */
 const ETH_ADDRESS_PLACEHOLDERS = new Set([
@@ -147,6 +182,12 @@ export class PayMuxServer {
             `Got: "${facilitatorUrl}"`
         );
       }
+    }
+
+    // Validate chain is a known value (catches typos like "ethereum-goerli")
+    if (config.x402?.chain) {
+      const chainErr = validateChain(config.x402.chain);
+      if (chainErr) throw new Error(chainErr);
     }
 
     return new PayMuxServerInstance(config);

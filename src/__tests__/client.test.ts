@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PayMux } from '../client/paymux.js';
 import { SpendingLimitError, SpendingEnforcer } from '../client/spending.js';
 import { PayMuxSession } from '../client/session.js';
-import type { SessionConfig } from '../client/session.js';
+import type { SessionConfig, SessionFetchDelegate } from '../client/session.js';
 
 describe('PayMux client', () => {
   describe('PayMux.create()', () => {
@@ -37,6 +37,34 @@ describe('PayMux client', () => {
       PayMux.create({ wallet: { privy: { walletId: 'test' } }, logger: customLogger });
       expect(warns.length).toBe(1);
       expect(warns[0].data).toEqual({ unsupportedWallet: 'privy' });
+    });
+
+    it('reads custom timeouts from config', () => {
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+        timeouts: { probeMs: 5000, paymentMs: 15000 },
+      });
+      // Verify internal fields are set from config
+      expect((agent as any).probeTimeoutMs).toBe(5000);
+      expect((agent as any).paymentTimeoutMs).toBe(15000);
+    });
+
+    it('uses default timeouts when config.timeouts is omitted', () => {
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+      });
+      expect((agent as any).probeTimeoutMs).toBe(10000);
+      expect((agent as any).paymentTimeoutMs).toBe(30000);
+    });
+
+    it('passes paymentTimeoutMs to MppClient and X402Client', () => {
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+        timeouts: { paymentMs: 20000 },
+      });
+      // Verify the timeout was passed through to protocol clients
+      expect((agent as any).mppClient.paymentTimeoutMs).toBe(20000);
+      expect((agent as any).x402Client.paymentTimeoutMs).toBe(20000);
     });
 
     it('initializes spending stats at zero', () => {
@@ -477,11 +505,9 @@ describe('PayMux client', () => {
   // ── Session management tests ──────────────────────────────────────
 
   describe('PayMuxSession — direct unit tests', () => {
-    const TEST_WALLET = { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' as const };
-
     /**
-     * Create a PayMuxSession with a mock mppxFetch so we don't need real mppx.
-     * Uses Object.assign to set the private mppxFetch and initialized fields.
+     * Create a PayMuxSession with a mock SessionFetchDelegate.
+     * The delegate mimics what PayMuxClient.fetch() does, without real payment logic.
      */
     function createMockSession(
       config: SessionConfig,
@@ -489,16 +515,12 @@ describe('PayMux client', () => {
       mockFetch?: typeof fetch
     ): PayMuxSession {
       const spendingEnforcer = enforcer ?? new SpendingEnforcer({});
-      const session = new PayMuxSession(TEST_WALLET, config, spendingEnforcer);
-
-      // Bypass initialize() by directly setting private fields.
-      // This avoids the dynamic import of mppx/client which is unavailable in tests.
-      (session as any).mppxFetch = mockFetch ?? vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
-      );
-      (session as any).initialized = true;
-
-      return session;
+      const delegate: SessionFetchDelegate = {
+        fetch: mockFetch ?? vi.fn().mockResolvedValue(
+          new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+        ),
+      };
+      return new PayMuxSession(delegate, config, spendingEnforcer);
     }
 
     it('creates a session with correct initial spending state', () => {

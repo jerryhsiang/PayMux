@@ -81,6 +81,38 @@ describe('PayMuxServer', () => {
       expect(payments.protocols).toEqual(['x402']);
     });
 
+    it('rejects unknown chain name', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0x0000000000000000000000000000000000000001', chain: 'ethereum-goerli' },
+      })).toThrow('Unknown chain "ethereum-goerli"');
+    });
+
+    it('rejects misspelled chain name', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0x0000000000000000000000000000000000000001', chain: 'bse' },
+      })).toThrow('Unknown chain "bse"');
+    });
+
+    it('accepts CAIP-2 eip155 chain format', () => {
+      const payments = PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0x0000000000000000000000000000000000000001', chain: 'eip155:8453' },
+      });
+      expect(payments.protocols).toEqual(['x402']);
+    });
+
+    it('accepts named chains: base, base-sepolia, polygon, solana', () => {
+      for (const chain of ['base', 'base-sepolia', 'polygon', 'solana'] as const) {
+        const payments = PayMuxServer.create({
+          accept: ['x402'],
+          x402: { recipient: '0x0000000000000000000000000000000000000001', chain },
+        });
+        expect(payments.protocols).toEqual(['x402']);
+      }
+    });
+
     it('creates instance with valid x402 + mpp config', () => {
       const payments = PayMuxServer.create({
         accept: ['x402', 'mpp'],

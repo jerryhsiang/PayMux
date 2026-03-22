@@ -1,15 +1,22 @@
-import type { WalletConfig, PaymentResult, MppReceipt } from '../shared/types.js';
+import type { PaymentResult } from '../shared/types.js';
 import { SpendingEnforcer, SpendingLimitError } from './spending.js';
 
 /**
- * Configuration for opening an MPP session.
+ * Interface for the parent client that sessions delegate fetch() to.
+ * This avoids a circular import between session.ts and paymux.ts.
+ */
+export interface SessionFetchDelegate {
+  fetch(url: string | URL, init?: RequestInit): Promise<Response>;
+}
+
+/**
+ * Configuration for opening a payment session.
  */
 export interface SessionConfig {
   /** Target URL origin to open a session with. */
   url: string;
   /**
    * Maximum budget for this session in USD.
-   * Maps to the on-chain deposit for the payment channel.
    * The session will reject requests that would exceed this budget.
    */
   budget: number;
@@ -42,17 +49,25 @@ interface SessionSpendingState {
 }
 
 /**
- * PayMuxSession — wraps mppx's sessionManager for session-based MPP payments.
+ * PayMuxSession — budget/duration envelope around regular PayMuxClient.fetch().
  *
- * Sessions amortize the initial on-chain channel open across multiple requests.
- * After the first request opens a payment channel (1 on-chain tx), subsequent
- * requests send off-chain vouchers (signed messages, no on-chain tx), making
- * them essentially free in gas costs.
+ * Instead of creating its own mppx session (which requires server-side session
+ * support and uses the `session()` payment method), sessions delegate to the
+ * parent PayMuxClient.fetch() which uses the charge-based payment path.
+ * This makes sessions work against ANY server (charge or session) by reusing
+ * all existing payment logic (protocol detection, spending limits, retries, timeouts).
+ *
+ * The session tracks its own budget: before each fetch, it checks that
+ * `spent + estimatedCost <= budget`. After each fetch, it records the actual
+ * amount from the payment result. When budget is exhausted or duration expires,
+ * further fetches are rejected.
  *
  * Flow:
- *   1. openSession() creates a sessionManager with a deposit (budget)
- *   2. session.fetch() sends requests that auto-pay via vouchers
- *   3. session.close() closes the channel and reclaims unspent deposit
+ *   1. openSession() creates a session with a budget and duration
+ *   2. session.fetch(path) delegates to client.fetch(fullUrl)
+ *   3. The parent client handles protocol detection, payment, etc.
+ *   4. Session tracks cumulative spending against its budget
+ *   5. session.close() releases unspent budget back to global limits
  *
  * The session enforces its own spending limits (budget, maxPerRequest)
  * independently from the global PayMuxClient limits. The global spending
@@ -67,17 +82,15 @@ interface SessionSpendingState {
  *   duration: 3600000,   // 1 hour
  * });
  *
- * // Each fetch reuses the payment channel — no new on-chain tx
+ * // Each fetch delegates to the parent client's payment logic
  * const res1 = await session.fetch('/api/data?q=foo');
  * const res2 = await session.fetch('/api/data?q=bar');
  *
- * // Close to reclaim unspent deposit
+ * // Close to reclaim unspent budget
  * await session.close();
  * ```
  */
 export class PayMuxSession {
-  private mppxFetch: typeof fetch | null = null;
-  private initialized = false;
   private closed = false;
   private expiresAt: number;
   private spendingState: SessionSpendingState;
@@ -88,7 +101,7 @@ export class PayMuxSession {
 
   /** @internal — Use PayMuxClient.openSession() to create sessions. */
   constructor(
-    private walletConfig: WalletConfig,
+    private client: SessionFetchDelegate,
     private config: SessionConfig,
     private globalSpendingEnforcer: SpendingEnforcer
   ) {
@@ -100,66 +113,17 @@ export class PayMuxSession {
       budget: config.budget,
       maxPerRequest: config.maxPerRequest,
     };
+
+    this.log(`[paymux] [session] Initialized — budget: $${this.config.budget.toFixed(2)}, expires: ${new Date(this.expiresAt).toISOString()}`);
   }
 
   /**
-   * Initialize the underlying mppx session.
+   * Fetch a resource using the session's budget envelope.
    *
-   * Uses mppx's `Mppx.create()` with the `session()` payment method in auto-mode
-   * (deposit parameter set). This gives us a session-aware `fetch` that:
-   * - Opens an on-chain payment channel on the first 402 challenge
-   * - Sends off-chain vouchers for subsequent requests
-   * - Manages cumulative amounts automatically
-   *
-   * Called automatically by PayMuxClient.openSession() after global spending checks.
-   * @internal
-   */
-  async initialize(): Promise<void> {
-    try {
-      const { Mppx, session } = await import('mppx/client');
-      const { privateKeyToAccount } = await import('viem/accounts');
-
-      if (!this.walletConfig.privateKey) {
-        throw new Error(
-          'PayMux Session: wallet.privateKey is required for MPP sessions'
-        );
-      }
-
-      const account = privateKeyToAccount(this.walletConfig.privateKey);
-
-      // Create an Mppx instance with session() in auto-mode.
-      // The `deposit` parameter enables automatic channel lifecycle management:
-      // - First 402 challenge → opens an on-chain channel with this deposit
-      // - Subsequent 402 challenges → sends off-chain vouchers (no on-chain tx)
-      // - Cumulative amounts tracked automatically
-      //
-      // polyfill: false → scoped fetch, does NOT patch globalThis.fetch
-      const mppx = Mppx.create({
-        methods: [session({
-          account,
-          maxDeposit: this.config.budget.toString(),
-        })],
-        polyfill: false,
-      });
-
-      this.mppxFetch = mppx.fetch;
-      this.initialized = true;
-
-      this.log(`[paymux] [session] Initialized — budget: $${this.config.budget.toFixed(2)}, expires: ${new Date(this.expiresAt).toISOString()}`);
-    } catch (error) {
-      throw new Error(
-        `PayMux Session: Failed to initialize mppx session. Ensure mppx and viem are installed. ` +
-          `${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
-
-  /**
-   * Fetch a resource using the session's payment channel.
-   *
-   * The path is resolved relative to the session's base URL.
-   * Each request sends an off-chain voucher (after the channel is opened),
-   * making subsequent requests essentially free in gas costs.
+   * The path is resolved relative to the session's base URL. Each request
+   * is delegated to the parent PayMuxClient.fetch() which handles protocol
+   * detection, payment, and retries. The session tracks cumulative spending
+   * against its budget.
    *
    * @param path - Absolute path or full URL. If a path (starting with /),
    *               it's resolved against the session's base URL.
@@ -170,20 +134,11 @@ export class PayMuxSession {
   async fetch(path: string, init?: RequestInit): Promise<Response> {
     this.assertOpen();
 
-    if (!this.initialized || !this.mppxFetch) {
-      throw new Error('PayMux Session: Not initialized. Call initialize() first.');
-    }
-
     // Resolve path to full URL
     const url = this.resolveUrl(path);
 
     this.log(`[paymux] [session] [>] ${init?.method ?? 'GET'} ${url}`);
 
-    // Session-level spending enforcement is done post-hoc based on receipts.
-    // We can't know the exact charge amount before the request (it depends on
-    // the server's per-request pricing which may vary). Instead, we check
-    // remaining budget and maxPerRequest constraints.
-    //
     // Pre-flight budget check: if we've already spent the full budget, reject early.
     if (this.spendingState.spent >= this.spendingState.budget) {
       throw new SpendingLimitError(
@@ -194,14 +149,11 @@ export class PayMuxSession {
       );
     }
 
-    // Use mppx's session-aware fetch which handles 402 challenge/voucher flow.
-    // On first 402: opens a channel with on-chain deposit.
-    // On subsequent 402s: sends off-chain vouchers automatically.
-    const response = await this.mppxFetch(url, init);
+    // Delegate to the parent client's fetch — handles protocol detection, payment, retries.
+    const response = await this.client.fetch(url, init);
 
-    // Parse the receipt to track spending
+    // Parse the receipt to track spending within the session
     const receiptHeader = response.headers.get('payment-receipt');
-    let receipt: MppReceipt | undefined;
     let spentAmount = 0;
 
     if (receiptHeader) {
@@ -210,18 +162,13 @@ export class PayMuxSession {
         const parsed: unknown = JSON.parse(decoded);
         if (parsed && typeof parsed === 'object') {
           const raw = parsed as Record<string, unknown>;
-          receipt = {
-            status: 'success',
-            method: raw.method as string,
-            reference: raw.reference as string,
-            timestamp: raw.timestamp as string,
-            externalId: raw.externalId as string | undefined,
-          };
 
           // Extract the amount spent from the receipt.
-          // Session receipts include a 'spent' field with the per-request charge.
+          // Receipts may include a 'spent' or 'amount' field with the per-request charge.
           if (typeof raw.spent === 'string') {
             spentAmount = parseFloat(raw.spent);
+          } else if (typeof raw.amount === 'string') {
+            spentAmount = parseFloat(raw.amount);
           }
         }
       } catch {
@@ -236,8 +183,7 @@ export class PayMuxSession {
         this.spendingState.maxPerRequest !== undefined &&
         spentAmount > this.spendingState.maxPerRequest
       ) {
-        // The payment already happened (voucher was sent), so we log a warning
-        // but still record it. Future: pre-check against challenge amount.
+        // The payment already happened, so we log a warning but still record it.
         this.log(
           `[paymux] [session] [warn] Request spent $${spentAmount.toFixed(6)} which exceeds maxPerRequest of $${this.spendingState.maxPerRequest.toFixed(2)}`
         );
@@ -249,14 +195,13 @@ export class PayMuxSession {
         protocol: 'mpp',
         amount: spentAmount.toString(),
         currency: 'USD',
-        transactionHash: receipt?.reference,
-        receipt,
+        transactionHash: undefined,
         settledAt: Date.now(),
       };
       this.paymentHistory.push(result);
 
       this.log(
-        `[paymux] [session] [ok] Paid $${spentAmount.toFixed(6)} via session voucher | cumulative: $${this.spendingState.spent.toFixed(6)}`
+        `[paymux] [session] [ok] Paid $${spentAmount.toFixed(6)} via session | cumulative: $${this.spendingState.spent.toFixed(6)}`
       );
     }
 
@@ -265,12 +210,9 @@ export class PayMuxSession {
   }
 
   /**
-   * Close the session and reclaim unspent deposit.
+   * Close the session and reclaim unspent budget.
    *
-   * This closes the on-chain payment channel. Any unspent deposit is
-   * returned to the wallet. The global spending enforcer is credited
-   * back the unspent portion.
-   *
+   * The global spending enforcer is credited back the unspent portion.
    * After close(), further fetch() calls will throw.
    */
   async close(): Promise<void> {
@@ -278,14 +220,6 @@ export class PayMuxSession {
     this.closed = true;
 
     this.log(`[paymux] [session] Closed — spent $${this.spendingState.spent.toFixed(2)} of $${this.spendingState.budget.toFixed(2)} budget`);
-
-    // NOTE: mppx's session() method with Mppx.create() does not expose a
-    // close() method on the fetch wrapper. Channel close is handled by mppx
-    // internally when the session deposit is exhausted, or the channel times
-    // out on-chain. For explicit close, use sessionManager (requires
-    // mppx/tempo/client which is not yet in mppx's public exports).
-    // TODO: Add explicit channel close when mppx exposes sessionManager
-    // in its public package exports.
 
     // Credit back unspent budget to the global spending enforcer.
     // When the session was opened, the full budget was charged globally.
@@ -312,8 +246,6 @@ export class PayMuxSession {
       requestCount: this.requestCount,
       /** Whether the session is still open. */
       isOpen: !this.closed && Date.now() < this.expiresAt,
-      /** Whether the session has been initialized. */
-      initialized: this.initialized,
       /** Payment history for this session. */
       history: [...this.paymentHistory],
     };

@@ -15,8 +15,12 @@ export class X402Client {
   private coreClient: unknown = null;
   private httpClient: unknown = null;
   private initialized = false;
+  /** Timeout in ms for x402 payment calls (default: 30s) */
+  private paymentTimeoutMs: number;
 
-  constructor(private walletConfig: WalletConfig) {}
+  constructor(private walletConfig: WalletConfig, paymentTimeoutMs?: number) {
+    this.paymentTimeoutMs = paymentTimeoutMs ?? 30_000;
+  }
 
   /**
    * Lazily initialize the x402 signing client.
@@ -95,17 +99,30 @@ export class X402Client {
     const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
 
     // Step 4: Make ONE retry request with payment proof
+    // Timeout: if the server hangs after receiving payment, the agent won't
+    // block indefinitely. Uses Promise.race similar to MppClient.
     const existingHeaders = init?.headers instanceof Headers
       ? Object.fromEntries(init.headers.entries())
       : (init?.headers as Record<string, string> | undefined) ?? {};
 
-    const response = await globalThis.fetch(url, {
-      ...init,
-      headers: {
-        ...existingHeaders,
-        ...paymentHeaders,
-      },
-    });
+    const timeoutMs = this.paymentTimeoutMs;
+    const response = await Promise.race([
+      globalThis.fetch(url, {
+        ...init,
+        headers: {
+          ...existingHeaders,
+          ...paymentHeaders,
+        },
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(
+            `PayMux: x402 payment timed out after ${timeoutMs}ms. The server may be unreachable. URL: ${url}`
+          )),
+          timeoutMs,
+        )
+      ),
+    ]);
 
     // If we still get a 402, payment was rejected
     if (response.status === 402) {

@@ -89,8 +89,10 @@ export class PayMuxClient {
   private spendingEnforcer: SpendingEnforcer;
   private config: PayMuxConfig;
   private logger: PayMuxLogger;
-  private paymentHistory: PaymentResult[] = [];
-  private static readonly MAX_HISTORY = 10000;
+  private paymentHistory: (PaymentResult | undefined)[];
+  private historyHead: number = 0;
+  private historyCount: number = 0;
+  private static readonly MAX_HISTORY = 10_000;
   private activeSessions: PayMuxSession[] = [];
 
   /**
@@ -120,10 +122,20 @@ export class PayMuxClient {
     retryMethods: string[];
   } | null;
 
+  /** Timeout for protocol-detection probes (default: 10s) */
+  private probeTimeoutMs: number;
+  /** Timeout for payment settlement calls (default: 30s) */
+  private paymentTimeoutMs: number;
+
   constructor(config: PayMuxConfig) {
     this.config = config;
     this.logger = resolveLogger({ debug: config.debug, logger: config.logger });
     this.spendingEnforcer = new SpendingEnforcer(config.limits ?? {});
+    this.paymentHistory = new Array(PayMuxClient.MAX_HISTORY);
+
+    // Resolve timeout config
+    this.probeTimeoutMs = config.timeouts?.probeMs ?? 10_000;
+    this.paymentTimeoutMs = config.timeouts?.paymentMs ?? 30_000;
 
     // Resolve retry config
     if (config.retry === false) {
@@ -139,8 +151,8 @@ export class PayMuxClient {
     }
 
     if (config.wallet?.privateKey) {
-      this.x402Client = new X402Client(config.wallet);
-      this.mppClient = new MppClient(config.wallet);
+      this.x402Client = new X402Client(config.wallet, this.paymentTimeoutMs);
+      this.mppClient = new MppClient(config.wallet, this.paymentTimeoutMs);
     } else if (config.wallet?.privy || config.wallet?.coinbase) {
       this.logger.warn(
         '[paymux] [warn] wallet.privy and wallet.coinbase are not yet supported. Only wallet.privateKey is currently implemented.',
@@ -294,11 +306,7 @@ export class PayMuxClient {
 
     // Step 6: Record successful payment (moves from pending to confirmed)
     this.spendingEnforcer.record(amountUsd);
-    this.paymentHistory.push(result);
-
-    if (this.paymentHistory.length > PayMuxClient.MAX_HISTORY) {
-      this.paymentHistory = this.paymentHistory.slice(-PayMuxClient.MAX_HISTORY);
-    }
+    this.recordPayment(result);
 
     this.logger.info(
       `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`,
@@ -362,11 +370,26 @@ export class PayMuxClient {
    */
   get spending() {
     const stats = this.spendingEnforcer.stats();
+    const history: PaymentResult[] = [];
+    for (let i = 0; i < this.historyCount; i++) {
+      const idx = (this.historyHead - this.historyCount + i + PayMuxClient.MAX_HISTORY) % PayMuxClient.MAX_HISTORY;
+      history.push(this.paymentHistory[idx]!);
+    }
     return {
       ...stats,
-      history: [...this.paymentHistory],
+      history,
       totalSpent: stats.totalSpent,
     };
+  }
+
+  /**
+   * Record a payment in the ring buffer. Overwrites the oldest entry
+   * when the buffer is full, avoiding array reallocation.
+   */
+  private recordPayment(result: PaymentResult): void {
+    this.paymentHistory[this.historyHead] = result;
+    this.historyHead = (this.historyHead + 1) % PayMuxClient.MAX_HISTORY;
+    if (this.historyCount < PayMuxClient.MAX_HISTORY) this.historyCount++;
   }
 
   /**
@@ -400,11 +423,12 @@ export class PayMuxClient {
   // ── Session management ─────────────────────────────────────────────
 
   /**
-   * Open an MPP session for amortized payments to a single origin.
+   * Open a payment session for budget-scoped payments to a single origin.
    *
-   * Sessions use mppx's payment channels: the first request opens an on-chain
-   * channel with a deposit (the session budget), and subsequent requests send
-   * off-chain vouchers — no new on-chain transaction per request.
+   * Sessions delegate to the parent client's fetch() for payment, which uses
+   * charge-based payments. This works against ANY server (charge or session)
+   * by reusing all existing payment logic (protocol detection, spending limits,
+   * retries, timeouts). The session tracks cumulative spending against its budget.
    *
    * The session budget is charged against global spending limits upfront when
    * the session is opened. When the session is closed, unspent budget is
@@ -418,11 +442,11 @@ export class PayMuxClient {
    *   duration: 3600000,   // 1 hour
    * });
    *
-   * // Each fetch reuses the payment channel — 1 HTTP call, no on-chain tx
+   * // Each fetch delegates to the parent client's payment logic
    * const res1 = await session.fetch('/api/data?q=foo');
    * const res2 = await session.fetch('/api/data?q=bar');
    *
-   * // Close to reclaim unspent deposit
+   * // Close to reclaim unspent budget
    * await session.close();
    * ```
    *
@@ -442,18 +466,10 @@ export class PayMuxClient {
     this.spendingEnforcer.check(config.budget);
 
     const session = new PayMuxSession(
-      this.config.wallet,
+      this,
       { ...config, debug: config.debug ?? this.config.debug },
       this.spendingEnforcer
     );
-
-    try {
-      await session.initialize();
-    } catch (error) {
-      // Release the reserved budget if initialization fails
-      this.spendingEnforcer.release(config.budget);
-      throw error;
-    }
 
     this.activeSessions.push(session);
 
@@ -508,7 +524,7 @@ export class PayMuxClient {
     }
 
     // Step 1: Probe to extract amount BEFORE paying
-    const probeResult = await probeMppAmount(url, init);
+    const probeResult = await probeMppAmount(url, init, this.probeTimeoutMs);
 
     // If probe returned non-402, endpoint no longer requires payment
     if (!probeResult) {
@@ -569,11 +585,7 @@ export class PayMuxClient {
 
     // Step 4: Record successful payment (moves from pending to confirmed)
     this.spendingEnforcer.record(amountUsd);
-    this.paymentHistory.push(result);
-
-    if (this.paymentHistory.length > PayMuxClient.MAX_HISTORY) {
-      this.paymentHistory = this.paymentHistory.slice(-PayMuxClient.MAX_HISTORY);
-    }
+    this.recordPayment(result);
 
     this.logger.info(
       `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via mpp (fast path)${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`,
@@ -655,7 +667,35 @@ export class PayMuxClient {
     this.protocolCache.clear();
   }
 
-  // ── Retry helpers ───────────────────────────────────────────────
+  // ── Timeout + Retry helpers ────────────────────────────────────
+
+  /**
+   * Fetch with probe timeout — wraps a single fetch call with an
+   * AbortController-based timeout using `this.probeTimeoutMs`.
+   *
+   * Prevents the agent from blocking indefinitely if the server hangs
+   * during the initial protocol-detection probe.
+   */
+  private async fetchWithProbeTimeout(url: string, init: RequestInit): Promise<Response> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.probeTimeoutMs);
+
+    try {
+      return await globalThis.fetch(url, {
+        ...init,
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error(
+          `PayMux: Probe timed out after ${this.probeTimeoutMs}ms. The server may be unreachable. URL: ${url}`
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
 
   /**
    * Probe with retry — wraps the initial probe fetch with retry logic
@@ -677,7 +717,7 @@ export class PayMuxClient {
 
     // No retry config, or method not retryable — single attempt
     if (!rc || !rc.retryMethods.includes(method)) {
-      return globalThis.fetch(url, init);
+      return this.fetchWithProbeTimeout(url, init);
     }
 
     const totalAttempts = 1 + rc.maxRetries; // 1 initial + N retries
@@ -686,7 +726,7 @@ export class PayMuxClient {
 
     for (let attempt = 0; attempt < totalAttempts; attempt++) {
       try {
-        const response = await globalThis.fetch(url, init);
+        const response = await this.fetchWithProbeTimeout(url, init);
 
         // If response status is not retryable, return immediately
         if (!rc.retryableStatusCodes.includes(response.status)) {

@@ -98,6 +98,75 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 - **Spending controls** -- per-request and per-day limits with concurrency safety
 - **EVM wallet support** -- private key-based signing for Base, Polygon, Ethereum
 - **Debug mode** -- `debug: true` for full payment flow logging
+- **Retry logic** -- automatic retries on transient failures (502, 503, 504)
+- **Sessions** -- budget-scoped payment sessions for multi-request workflows
+- **Custom timeouts** -- configurable probe and payment settlement timeouts
+- **Custom logger** -- plug in your own structured logger or disable logging entirely
+
+### Retry Logic
+
+Retries transient errors (502/503/504) with exponential backoff. Safe methods (GET/HEAD) only by default.
+
+```typescript
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  retry: { maxRetries: 2, baseDelayMs: 1000 }, // defaults
+});
+
+// Disable retries entirely
+const agent2 = PayMux.create({ retry: false });
+```
+
+### Custom Logger
+
+Replace the default `console.log` debug output with your own structured logger, or disable logging.
+
+```typescript
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  logger: {
+    debug: (msg, data) => myLogger.debug(msg, data),
+    info:  (msg, data) => myLogger.info(msg, data),
+    warn:  (msg, data) => myLogger.warn(msg, data),
+    error: (msg, data) => myLogger.error(msg, data),
+  },
+});
+
+// Disable all logging (overrides debug: true)
+const silent = PayMux.create({ logger: false });
+```
+
+### Sessions
+
+Budget-scoped sessions for multi-request workflows. The session budget is reserved upfront against global limits and released on close.
+
+```typescript
+const session = await agent.openSession({
+  url: 'https://api.example.com',
+  budget: 5.00,       // max $5 for this session
+  duration: 3600000,  // 1 hour (default)
+});
+
+const res1 = await session.fetch('/api/data?q=foo');
+const res2 = await session.fetch('/api/data?q=bar');
+console.log(session.spending); // { spent, remaining, requestCount, ... }
+
+await session.close(); // releases unspent budget
+```
+
+### Timeouts
+
+Configure how long PayMux waits for protocol detection probes and payment settlement.
+
+```typescript
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  timeouts: {
+    probeMs: 5000,    // protocol detection timeout (default: 10000)
+    paymentMs: 15000, // payment settlement timeout (default: 30000)
+  },
+});
+```
 
 ---
 

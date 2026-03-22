@@ -46,7 +46,8 @@ export class SpendingEnforcer {
         `Payment of $${amount.toFixed(2)} would exceed daily limit of $${this.limits.perDay.toFixed(2)} (spent: $${this.dailySpend.toFixed(2)}, pending: $${this.pendingSpend.toFixed(2)})`,
         'perDay',
         amount,
-        this.limits.perDay
+        this.limits.perDay,
+        effectiveDaily
       );
     }
 
@@ -128,13 +129,21 @@ export class SpendingEnforcer {
  * Error thrown when a spending limit is exceeded
  */
 export class SpendingLimitError extends Error {
+  /**
+   * Current daily spend when the error was thrown (USD).
+   * Only populated for perDay limit errors; undefined for other limit types.
+   */
+  public readonly currentSpent?: number;
+
   constructor(
     message: string,
     public readonly limitType: 'perRequest' | 'perDay' | 'perSession' | 'requireApproval',
     public readonly requestedAmount: number,
-    public readonly limit: number
+    public readonly limit: number,
+    currentSpent?: number
   ) {
     super(message);
     this.name = 'SpendingLimitError';
+    this.currentSpent = currentSpent;
   }
 }

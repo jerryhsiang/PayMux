@@ -61,6 +61,52 @@ describe('SpendingEnforcer', () => {
       // Now at $5.00, next payment should fail
       expect(() => enforcer.check(0.01)).toThrow(SpendingLimitError);
     });
+
+    it('includes currentSpent in perDay SpendingLimitError', () => {
+      const enforcer = new SpendingEnforcer({ perDay: 10.00 });
+      enforcer.check(7.00);
+      enforcer.record(7.00);
+      try {
+        enforcer.check(4.00);
+        expect.unreachable('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SpendingLimitError);
+        const err = e as SpendingLimitError;
+        expect(err.limitType).toBe('perDay');
+        expect(err.currentSpent).toBe(7.00); // $7 confirmed, $0 pending
+        expect(err.requestedAmount).toBe(4.00);
+        expect(err.limit).toBe(10.00);
+      }
+    });
+
+    it('includes pending spend in currentSpent for perDay errors', () => {
+      const enforcer = new SpendingEnforcer({ perDay: 10.00 });
+      enforcer.check(3.00);
+      enforcer.record(3.00);
+      enforcer.check(5.00); // $5 pending, $3 confirmed = $8 effective
+      try {
+        enforcer.check(3.00); // 8 + 3 = 11 > 10
+        expect.unreachable('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SpendingLimitError);
+        const err = e as SpendingLimitError;
+        expect(err.limitType).toBe('perDay');
+        expect(err.currentSpent).toBe(8.00); // $3 confirmed + $5 pending
+      }
+    });
+
+    it('does not include currentSpent for perRequest errors', () => {
+      const enforcer = new SpendingEnforcer({ perRequest: 1.00 });
+      try {
+        enforcer.check(2.00);
+        expect.unreachable('should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(SpendingLimitError);
+        const err = e as SpendingLimitError;
+        expect(err.limitType).toBe('perRequest');
+        expect(err.currentSpent).toBeUndefined();
+      }
+    });
   });
 
   describe('concurrency (pending amounts)', () => {

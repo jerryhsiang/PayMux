@@ -1,11 +1,21 @@
 import { describe, it, expect, vi } from 'vitest';
 import { PayMux } from '../client/paymux.js';
 import { PayMuxSession } from '../client/session.js';
+import type { SessionFetchDelegate } from '../client/session.js';
 import { SpendingEnforcer, SpendingLimitError } from '../client/spending.js';
 
 const TEST_KEY = '0x0000000000000000000000000000000000000000000000000000000000000001' as const;
 
-describe('PayMuxSession — MPP session management', () => {
+/** Create a mock SessionFetchDelegate (mimics a PayMuxClient). */
+function createMockDelegate(mockFetch?: typeof fetch): SessionFetchDelegate {
+  return {
+    fetch: mockFetch ?? vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+    ),
+  };
+}
+
+describe('PayMuxSession — session management', () => {
   describe('openSession() via PayMuxClient', () => {
     it('throws when no wallet is configured', async () => {
       const agent = PayMux.create({});
@@ -58,9 +68,6 @@ describe('PayMuxSession — MPP session management', () => {
         limits: { perDay: 100.00 },
       });
 
-      // openSession will pass the spending check ($5 < $100 daily limit),
-      // and mppx initialization succeeds (Mppx.create() + session() don't
-      // require on-chain infrastructure until a 402 challenge is received).
       const session = await agent.openSession({
         url: 'https://api.example.com',
         budget: 5.00,
@@ -94,9 +101,10 @@ describe('PayMuxSession — MPP session management', () => {
   describe('PayMuxSession unit tests', () => {
     it('constructs with correct defaults', () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -110,7 +118,6 @@ describe('PayMuxSession — MPP session management', () => {
       expect(session.spending.remaining).toBe(5.00);
       expect(session.spending.requestCount).toBe(0);
       expect(session.spending.isOpen).toBe(true);
-      expect(session.spending.initialized).toBe(false);
       expect(session.spending.history).toEqual([]);
       expect(session.timeRemaining).toBeGreaterThan(0);
       expect(session.timeRemaining).toBeLessThanOrEqual(3_600_000);
@@ -118,9 +125,10 @@ describe('PayMuxSession — MPP session management', () => {
 
     it('constructs with custom duration', () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 10.00,
@@ -134,11 +142,12 @@ describe('PayMuxSession — MPP session management', () => {
       expect(session.timeRemaining).toBeGreaterThan(0);
     });
 
-    it('throws on fetch() when not initialized', async () => {
+    it('fetch() works immediately after construction (no initialization needed)', async () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -146,16 +155,17 @@ describe('PayMuxSession — MPP session management', () => {
         enforcer
       );
 
-      await expect(
-        session.fetch('/api/data')
-      ).rejects.toThrow('Not initialized');
+      const response = await session.fetch('/api/data');
+      expect(response.status).toBe(200);
+      expect(session.spending.requestCount).toBe(1);
     });
 
     it('throws on fetch() after close()', async () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -173,9 +183,10 @@ describe('PayMuxSession — MPP session management', () => {
 
     it('close() is idempotent — multiple calls do not throw', async () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -197,8 +208,10 @@ describe('PayMuxSession — MPP session management', () => {
       enforcer.check(5.00); // Reserves $5 as pending
       expect(enforcer.stats().pendingSpend).toBe(5.00);
 
+      const delegate = createMockDelegate();
+
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -216,8 +229,10 @@ describe('PayMuxSession — MPP session management', () => {
       const enforcer = new SpendingEnforcer({ perDay: 100.00 });
       enforcer.check(5.00); // Reserve $5
 
+      const delegate = createMockDelegate();
+
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -237,9 +252,10 @@ describe('PayMuxSession — MPP session management', () => {
 
     it('expires after configured duration', async () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -260,10 +276,14 @@ describe('PayMuxSession — MPP session management', () => {
     });
 
     it('handles full URL passed to fetch()', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response('', { status: 200 })
+      );
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate(mockFetch);
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -271,18 +291,19 @@ describe('PayMuxSession — MPP session management', () => {
         enforcer
       );
 
-      // Full URLs should work — the fetch will fail because not initialized,
-      // but the URL resolution should not throw
-      await expect(
-        session.fetch('https://other-api.example.com/data')
-      ).rejects.toThrow('Not initialized');
+      await session.fetch('https://other-api.example.com/data');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://other-api.example.com/data',
+        undefined
+      );
     });
 
     it('strips trailing slashes from base URL', () => {
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com/',
           budget: 5.00,
@@ -297,9 +318,10 @@ describe('PayMuxSession — MPP session management', () => {
     it('debug logging works when enabled', async () => {
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -319,9 +341,10 @@ describe('PayMuxSession — MPP session management', () => {
     it('no logging when debug is false', async () => {
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const enforcer = new SpendingEnforcer({});
+      const delegate = createMockDelegate();
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -336,11 +359,15 @@ describe('PayMuxSession — MPP session management', () => {
       logSpy.mockRestore();
     });
 
-    it('initialize() succeeds when mppx is installed', async () => {
+    it('session delegates to parent client fetch', async () => {
       const enforcer = new SpendingEnforcer({});
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+      );
+      const delegate = createMockDelegate(mockFetch);
 
       const session = new PayMuxSession(
-        { privateKey: TEST_KEY },
+        delegate,
         {
           url: 'https://api.example.com',
           budget: 5.00,
@@ -348,12 +375,13 @@ describe('PayMuxSession — MPP session management', () => {
         enforcer
       );
 
-      // mppx is installed, so initialize() should succeed.
-      // Mppx.create() + session() only need on-chain infra when
-      // a 402 challenge is actually received, not at init time.
-      await session.initialize();
+      await session.fetch('/api/data');
 
-      expect(session.spending.initialized).toBe(true);
+      // Should have called the delegate's fetch with full URL
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/api/data',
+        undefined
+      );
     });
   });
 });

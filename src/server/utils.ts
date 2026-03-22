@@ -1,10 +1,10 @@
 /**
- * Retry a fetch call on transient (5xx) failures.
+ * Retry a fetch call on transient failures.
  *
- * - Only retries on HTTP 5xx status codes (server errors).
+ * - Retries on HTTP 5xx status codes (server errors).
+ * - Retries on network errors (TypeError from fetch — DNS failure, connection refused, etc.).
  * - 4xx responses are real errors and are returned immediately.
- * - Network/timeout errors (thrown exceptions) are NOT retried — they propagate.
- * - Max 2 retries with a 1 second delay between attempts.
+ * - Max 2 retries with exponential backoff (delayMs * 2^attempt).
  */
 export async function fetchWithRetry(
   input: string | URL | Request,
@@ -13,22 +13,30 @@ export async function fetchWithRetry(
   delayMs: number = 1000
 ): Promise<Response> {
   let lastResponse: Response | undefined;
+  let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const response = await fetch(input, init);
+    try {
+      const response = await fetch(input, init);
 
-    // 5xx → transient server error, eligible for retry
-    if (response.status >= 500 && response.status < 600 && attempt < maxRetries) {
+      // Non-5xx or final attempt — return as-is
+      if (response.status < 500 || attempt === maxRetries) {
+        return response;
+      }
+
+      // 5xx → transient server error, eligible for retry
       lastResponse = response;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      continue;
+    } catch (err) {
+      // Network error (DNS failure, connection refused, timeout, etc.)
+      if (attempt === maxRetries) throw err;
+      lastError = err;
     }
 
-    // 2xx, 3xx, 4xx, or final 5xx attempt — return as-is
-    return response;
+    await new Promise((resolve) => setTimeout(resolve, delayMs * Math.pow(2, attempt)));
   }
 
-  // Should not be reached, but satisfy TypeScript
+  // All retries exhausted — throw the last network error or return the last 5xx response
+  if (lastError) throw lastError;
   return lastResponse!;
 }
 

@@ -1,5 +1,5 @@
 import type { PaymentRequirement, Protocol } from '../../shared/types.js';
-import { fromBaseUnits, mppAmountToUsd } from '../utils.js';
+import { fromBaseUnits, mppAmountToUsd, base64urlDecode } from '../utils.js';
 
 /**
  * Header names used by payment protocols
@@ -234,22 +234,6 @@ function parseMppChallenge(
     paymentMethods: params.methods?.split(',') ?? undefined,
     raw: { header: headerValue, params, requestData },
   };
-}
-
-/**
- * Decode a base64url-encoded string to UTF-8 text.
- *
- * base64url uses `-` instead of `+` and `_` instead of `/`, with no padding.
- * This converts to standard base64 before decoding via atob().
- */
-function base64urlDecode(input: string): string {
-  // Replace base64url characters with standard base64 equivalents
-  let base64 = input.replace(/-/g, '+').replace(/_/g, '/');
-  // Add padding if necessary
-  const pad = base64.length % 4;
-  if (pad === 2) base64 += '==';
-  else if (pad === 3) base64 += '=';
-  return atob(base64);
 }
 
 /**

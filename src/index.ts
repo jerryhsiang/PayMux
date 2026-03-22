@@ -25,7 +25,7 @@ export { SpendingLimitError } from './client/spending.js';
 
 // Sessions
 export { PayMuxSession } from './client/session.js';
-export type { SessionConfig } from './client/session.js';
+export type { SessionConfig, SessionFetchDelegate } from './client/session.js';
 
 
 // Logger
