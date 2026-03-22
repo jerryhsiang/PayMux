@@ -13,21 +13,27 @@ export interface PayMuxServerConfig {
     recipient: `0x${string}`;
     /** Chain to settle on (default: 'base') */
     chain?: Chain;
-    /** Facilitator URL (default: 'https://facilitator.x402.org') */
+    /** Facilitator URL (default: 'https://x402.org/facilitator') */
     facilitator?: string;
-    /** Token to accept (default: 'USDC') */
+    /** Token contract address (default: USDC on selected chain) */
     asset?: string;
   };
 
   /** MPP configuration (Stripe/Tempo) */
   mpp?: {
-    /** Stripe secret key (for card-based MPP) */
-    stripeSecretKey?: string;
-    /** Tempo recipient address (for crypto-based MPP) */
+    /** HMAC secret key for challenge binding (required). Generate with: crypto.randomBytes(32).toString('base64') */
+    secretKey: string;
+    /** Tempo recipient address */
     tempoRecipient?: `0x${string}`;
+    /** Use Tempo testnet (default: false) */
+    testnet?: boolean;
+    /** Stripe secret key (for card-based MPP via Stripe) */
+    stripeSecretKey?: string;
+    /** Realm identifier (default: auto-detected) */
+    realm?: string;
   };
 
-  /** Card configuration — week 12 */
+  /** Card configuration — future release */
   card?: {
     stripeSecretKey?: string;
   };
@@ -45,10 +51,7 @@ export type MiddlewareHandler = (
 
 /**
  * Universal PayMux middleware returned by charge().
- *
- * Works as both Express middleware (req, res, next — 3 args) and
- * Hono middleware (c, next — 2 args). Framework is auto-detected
- * based on argument count at call time.
+ * Works as Express middleware (3 args) or Hono middleware (2 args).
  */
 export type PayMuxMiddleware = (...args: unknown[]) => unknown;
 

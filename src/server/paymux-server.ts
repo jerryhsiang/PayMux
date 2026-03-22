@@ -47,10 +47,18 @@ export class PayMuxServer {
     }
 
     if (config.accept.includes('mpp')) {
-      console.warn(
-        '[paymux] Warning: MPP server support ships in v0.2.0. ' +
-          'MPP will be ignored in the accept[] array for now. Only x402 is active.'
-      );
+      if (!config.mpp) {
+        throw new Error(
+          'PayMux Server: mpp is in accept[] but mpp config is missing. ' +
+            'Pass mpp: { secretKey: "...", tempoRecipient: "0x..." }'
+        );
+      }
+      if (!config.mpp.secretKey) {
+        throw new Error(
+          'PayMux Server: mpp.secretKey is required for MPP challenge binding. ' +
+            'Generate one with: crypto.randomBytes(32).toString("base64")'
+        );
+      }
     }
 
     // Issue #9: Validate facilitator URL enforces HTTPS

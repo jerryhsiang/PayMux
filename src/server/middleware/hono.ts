@@ -2,36 +2,37 @@ import type { Context, Next, MiddlewareHandler } from 'hono';
 import type { PayMuxServerConfig } from '../types.js';
 import type { ChargeOptions } from '../../shared/types.js';
 import { verifyX402Payment, settleX402Payment } from '../protocols/x402.js';
+import { handleMppRequest } from '../protocols/mpp.js';
 import { buildPaymentRequirements } from './shared.js';
 
 /**
  * Create Hono middleware that gates an endpoint behind payment.
  *
- * Works with Cloudflare Workers, Deno, Bun, and Node.js.
- *
- * @example
- * ```typescript
- * app.get('/api/data',
- *   payments.charge({ amount: 0.01, currency: 'USD' }),
- *   (c) => c.json({ data: 'protected' })
- * );
- * ```
+ * Supports both x402 and MPP protocols. Works with Cloudflare Workers,
+ * Deno, Bun, and Node.js.
  */
 export function createHonoCharge(
   config: PayMuxServerConfig,
   chargeOpts: ChargeOptions
 ): MiddlewareHandler {
   return async (c: Context, next: Next) => {
-    // Check for x402 PAYMENT-SIGNATURE header only (spec-compliant)
-    const paymentSignature = c.req.header('payment-signature');
+    // Detect payment protocol from headers
+    const hasX402 = !!c.req.header('payment-signature');
+    const authHeader = c.req.header('authorization');
+    const hasMpp = authHeader?.startsWith('Payment ') ?? false;
 
-    if (!paymentSignature) {
-      // No payment — return 402 with payment requirements
+    if (!hasX402 && !hasMpp) {
+      // No payment — return 402 with requirements for all supported protocols
       const resource = c.req.url;
       const requirements = buildPaymentRequirements(config, chargeOpts, resource);
 
       c.status(402);
-      c.header('Payment-Required', requirements.paymentRequired);
+      if (requirements.paymentRequired) {
+        c.header('Payment-Required', requirements.paymentRequired);
+      }
+      if (requirements.wwwAuthenticate) {
+        c.header('WWW-Authenticate', requirements.wwwAuthenticate);
+      }
 
       return c.json({
         error: 'Payment Required',
@@ -40,16 +41,34 @@ export function createHonoCharge(
       });
     }
 
-    // Has payment — verify and settle
-    const request = c.req.raw;
+    // MPP payment path — delegate to mppx
+    if (hasMpp && config.accept.includes('mpp') && config.mpp) {
+      const mppResult = await handleMppRequest(c.req.raw, config, chargeOpts);
 
-    if (config.accept.includes('x402') && config.x402) {
-      const verification = await verifyX402Payment(request, config, chargeOpts);
+      if (mppResult.handled) {
+        if (mppResult.status === 402 && mppResult.challengeResponse) {
+          // Return the mppx challenge response directly
+          return mppResult.challengeResponse;
+        }
+
+        if (mppResult.status === 200 && mppResult.withReceipt) {
+          // Payment verified — continue to handler, then wrap response with receipt
+          await next();
+          // Wrap the response to attach Payment-Receipt header
+          c.res = mppResult.withReceipt(c.res);
+          return;
+        }
+      }
+      // MPP handling failed — fall through to 402
+    }
+
+    // x402 payment path
+    if (hasX402 && config.accept.includes('x402') && config.x402) {
+      const verification = await verifyX402Payment(c.req.raw, config, chargeOpts);
 
       if (verification.valid) {
-        const settlement = await settleX402Payment(request, config, chargeOpts);
+        const settlement = await settleX402Payment(c.req.raw, config, chargeOpts);
 
-        // Issue #8: Always set Payment-Response header, even without transaction hash
         c.header(
           'Payment-Response',
           btoa(
@@ -68,7 +87,7 @@ export function createHonoCharge(
       }
     }
 
-    // Payment verification or settlement failed
+    // Payment verification failed
     c.status(402);
     return c.json({
       error: 'Payment Required',
