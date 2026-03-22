@@ -20,12 +20,14 @@ describe('detectProtocol', () => {
     it('detects x402 v2 from PAYMENT-REQUIRED header', async () => {
       const requirements = {
         x402Version: 2,
+        resource: { url: 'https://api.example.com/data' },
         accepts: [{
           scheme: 'exact',
           network: 'eip155:8453',
-          maxAmountRequired: '10000',
+          amount: '10000',
           payTo: '0xRecipient',
           asset: '0xUSDC',
+          extra: {},
         }],
       };
       const encoded = btoa(JSON.stringify(requirements));
@@ -69,7 +71,7 @@ describe('detectProtocol', () => {
       for (const [network, expectedChain] of testCases) {
         const encoded = btoa(JSON.stringify({
           x402Version: 2,
-          accepts: [{ scheme: 'exact', network, maxAmountRequired: '100', payTo: '0x1', asset: '0x2' }],
+          accepts: [{ scheme: 'exact', network, amount: '100', payTo: '0x1', asset: '0x2', extra: {} }],
         }));
         const response = mock402({ 'payment-required': encoded });
         const result = await detectProtocol(response);
@@ -233,7 +235,7 @@ describe('detectProtocol', () => {
     it('detects both x402 and MPP when both headers present', async () => {
       const x402 = btoa(JSON.stringify({
         x402Version: 2,
-        accepts: [{ scheme: 'exact', network: 'eip155:8453', maxAmountRequired: '10000', payTo: '0x1', asset: '0x2' }],
+        accepts: [{ scheme: 'exact', network: 'eip155:8453', amount: '10000', payTo: '0x1', asset: '0x2', extra: {} }],
       }));
 
       const response = mock402({
@@ -252,12 +254,14 @@ describe('detectProtocol', () => {
     it('detects x402 from response body when no headers', async () => {
       const body = {
         x402Version: 2,
+        resource: { url: 'https://api.example.com/data' },
         accepts: [{
           scheme: 'exact',
           network: 'eip155:8453',
-          maxAmountRequired: '10000',
+          amount: '10000',
           payTo: '0xRecipient',
           asset: '0xUSDC',
+          extra: {},
         }],
       };
       const response = mock402({}, body);

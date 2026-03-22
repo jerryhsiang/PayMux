@@ -12,6 +12,7 @@ function createMockDelegate(mockFetch?: typeof fetch): SessionFetchDelegate {
     fetch: mockFetch ?? vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
     ),
+    spending: { history: [] },
   };
 }
 
@@ -241,13 +242,16 @@ describe('PayMuxSession — session management', () => {
       );
 
       // Manually simulate spending $2 within the session
-      // (In real usage, this happens via fetch() + receipt parsing)
+      // (In real usage, this happens via fetch() + payment history tracking)
       (session as any).spendingState.spent = 2.00;
 
       await session.close();
 
-      // Only $3 (5 - 2) should be released
-      expect(enforcer.stats().pendingSpend).toBe(2.00);
+      // close() records the $2 spent portion (moving it from pending to confirmed)
+      // and releases the $3 unspent portion. pendingSpend should be 0.
+      expect(enforcer.stats().pendingSpend).toBe(0);
+      expect(enforcer.stats().dailySpend).toBe(2.00);
+      expect(enforcer.stats().totalSpent).toBe(2.00);
     });
 
     it('expires after configured duration', async () => {
@@ -294,7 +298,7 @@ describe('PayMuxSession — session management', () => {
       await session.fetch('https://other-api.example.com/data');
       expect(mockFetch).toHaveBeenCalledWith(
         'https://other-api.example.com/data',
-        undefined
+        expect.objectContaining({ skipSpendingCheck: true })
       );
     });
 
@@ -380,7 +384,7 @@ describe('PayMuxSession — session management', () => {
       // Should have called the delegate's fetch with full URL
       expect(mockFetch).toHaveBeenCalledWith(
         'https://api.example.com/api/data',
-        undefined
+        expect.objectContaining({ skipSpendingCheck: true })
       );
     });
   });

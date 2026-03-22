@@ -115,8 +115,15 @@ function parseX402V2(
 
   return accepts.map(
     (accept: Record<string, unknown>): PaymentRequirement => {
-      const baseAmount = String(accept.maxAmountRequired ?? accept.price ?? '0');
+      // x402 v2 uses "amount"; v1 uses "maxAmountRequired". Try v2 first, fall back to v1.
+      const baseAmount = String(accept.amount ?? accept.maxAmountRequired ?? accept.price ?? '0');
       const asset = String(accept.asset ?? '');
+      // x402 v2: resource is a top-level ResourceInfo object { url, description?, mimeType? }
+      // x402 v1: resource is a string inside each accepts entry
+      const resource = parsed.resource;
+      const resourceUrl = resource && typeof resource === 'object'
+        ? String((resource as Record<string, unknown>).url ?? '')
+        : String(resource ?? '');
       return {
         protocol: 'x402' as Protocol,
         amount: baseAmount,
@@ -133,7 +140,7 @@ function parseX402V2(
         scheme: String(accept.scheme ?? 'exact'),
         maxAmountRequired: baseAmount,
         asset,
-        resource: String(parsed.resource ?? ''),
+        resource: resourceUrl,
         raw: accept,
       };
     }

@@ -14,13 +14,16 @@ const TOKEN_DECIMALS: Record<string, number> = {
   '0x41e94eb71ef8c9863e91b9c684d4e1b9f5b1eea5': 6, // Polygon Amoy
   '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6, // Ethereum mainnet
   '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238': 6, // Ethereum Sepolia
-  // PathUSD on Tempo chain — 6 decimals (used by MPP/mppx)
+  // PathUSD on Tempo testnet — 6 decimals (used by MPP/mppx)
   '0x20c0000000000000000000000000000000000000': 6,
+  // USDC on Tempo mainnet — 6 decimals (used by MPP/mppx in production)
+  '0x20c000000000000000000000b9537d11c60e8b50': 6,
 };
 
 /** Human-readable token names by address (lowercase) for debug output */
 const TOKEN_NAMES: Record<string, string> = {
-  '0x20c0000000000000000000000000000000000000': 'PathUSD',
+  '0x20c0000000000000000000000000000000000000': 'PathUSD (Tempo Testnet)',
+  '0x20c000000000000000000000b9537d11c60e8b50': 'USDC (Tempo Mainnet)',
   '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'USDC (Base)',
   '0x036cbd53842c5426634e7929541ec2318f3dcf7e': 'USDC (Base Sepolia)',
   '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359': 'USDC (Polygon)',

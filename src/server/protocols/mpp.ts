@@ -99,10 +99,12 @@ async function getMppChargeFactory(config: PayMuxServerConfig): Promise<ChargeFa
   const methods = [];
 
   // Tempo payment method (crypto-based)
+  // Omit `currency` to let mppx use its chain-appropriate default:
+  // - Testnet (chainId 42431): PathUSD 0x20c0000000000000000000000000000000000000
+  // - Mainnet (chainId 4217): USDC 0x20C000000000000000000000b9537d11c60E8b50
   if (config.mpp.tempoRecipient) {
     methods.push(
       tempo({
-        currency: '0x20c0000000000000000000000000000000000000', // PathUSD
         recipient: config.mpp.tempoRecipient,
         testnet: config.mpp.testnet ?? false,
       })

@@ -4,9 +4,16 @@ import { SpendingEnforcer, SpendingLimitError } from './spending.js';
 /**
  * Interface for the parent client that sessions delegate fetch() to.
  * This avoids a circular import between session.ts and paymux.ts.
+ *
+ * Sessions use `fetch()` with extended options to coordinate with the parent:
+ * - `skipSpendingCheck: true` avoids double-charging global limits (the session
+ *   budget was already reserved globally when the session was opened).
+ * - The parent still handles protocol detection, payment, and retries.
  */
 export interface SessionFetchDelegate {
-  fetch(url: string | URL, init?: RequestInit): Promise<Response>;
+  fetch(url: string | URL, init?: RequestInit & { skipSpendingCheck?: boolean }): Promise<Response>;
+  /** Access the parent client's spending history to find the last payment amount. */
+  readonly spending: { history: Array<{ amount: string; protocol: string; settledAt?: number }> };
 }
 
 /**
@@ -149,31 +156,25 @@ export class PayMuxSession {
       );
     }
 
-    // Delegate to the parent client's fetch — handles protocol detection, payment, retries.
-    const response = await this.client.fetch(url, init);
+    // Record the parent's payment history length BEFORE the fetch so we can
+    // detect new payments added by the parent client during this request.
+    const historyBefore = this.client.spending.history.length;
 
-    // Parse the receipt to track spending within the session
-    const receiptHeader = response.headers.get('payment-receipt');
+    // Delegate to the parent client's fetch — handles protocol detection, payment, retries.
+    // skipSpendingCheck: true avoids double-charging global limits. The session's full
+    // budget was already reserved globally when openSession() called spendingEnforcer.check().
+    const response = await this.client.fetch(url, { ...init, skipSpendingCheck: true } as RequestInit);
+
+    // Track spending from the parent client's payment history rather than parsing
+    // receipt headers. This works for ALL protocols (x402 uses Payment-Response,
+    // MPP uses Payment-Receipt — neither reliably includes the amount in the header).
+    const historyAfter = this.client.spending.history;
     let spentAmount = 0;
 
-    if (receiptHeader) {
-      try {
-        const decoded = atob(receiptHeader.replace(/-/g, '+').replace(/_/g, '/'));
-        const parsed: unknown = JSON.parse(decoded);
-        if (parsed && typeof parsed === 'object') {
-          const raw = parsed as Record<string, unknown>;
-
-          // Extract the amount spent from the receipt.
-          // Receipts may include a 'spent' or 'amount' field with the per-request charge.
-          if (typeof raw.spent === 'string') {
-            spentAmount = parseFloat(raw.spent);
-          } else if (typeof raw.amount === 'string') {
-            spentAmount = parseFloat(raw.amount);
-          }
-        }
-      } catch {
-        // Receipt parsing failed — non-critical
-      }
+    if (historyAfter.length > historyBefore) {
+      // The parent client recorded a new payment during our fetch
+      const lastPayment = historyAfter[historyAfter.length - 1];
+      spentAmount = parseFloat(lastPayment.amount) || 0;
     }
 
     // Update session spending state
@@ -192,7 +193,7 @@ export class PayMuxSession {
       this.spendingState.spent += spentAmount;
 
       const result: PaymentResult = {
-        protocol: 'mpp',
+        protocol: (historyAfter[historyAfter.length - 1]?.protocol ?? 'mpp') as PaymentResult['protocol'],
         amount: spentAmount.toString(),
         currency: 'USD',
         transactionHash: undefined,
@@ -221,10 +222,18 @@ export class PayMuxSession {
 
     this.log(`[paymux] [session] Closed — spent $${this.spendingState.spent.toFixed(2)} of $${this.spendingState.budget.toFixed(2)} budget`);
 
-    // Credit back unspent budget to the global spending enforcer.
-    // When the session was opened, the full budget was charged globally.
-    // Now we release the portion that wasn't actually used.
-    const unspent = Math.max(0, this.spendingState.budget - this.spendingState.spent);
+    // Move session spending from pendingSpend to confirmed (dailySpend/totalSpent).
+    // When the session was opened, the full budget was reserved as pendingSpend.
+    // The spent portion must be moved to confirmed via record(), and the unspent
+    // portion released via release(). Without this, spent amounts stay in
+    // pendingSpend forever, eventually starving the agent of spending capacity.
+    const spent = this.spendingState.spent;
+    const unspent = Math.max(0, this.spendingState.budget - spent);
+
+    if (spent > 0) {
+      this.globalSpendingEnforcer.record(spent);
+      this.log(`[paymux] [session] Recorded $${spent.toFixed(2)} spent to global limits`);
+    }
     if (unspent > 0) {
       this.globalSpendingEnforcer.release(unspent);
       this.log(`[paymux] [session] Released $${unspent.toFixed(2)} unspent budget back to global limits`);

@@ -21,7 +21,12 @@ const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
  * Generate x402 payment requirements for a 402 response.
  *
  * Amounts are converted to base units (e.g., 0.01 USD → "10000" for 6-decimal USDC).
- * This matches the x402 v2 spec where maxAmountRequired is in the token's smallest unit.
+ * This matches the x402 v2 spec where amount is in the token's smallest unit.
+ *
+ * x402 v2 format:
+ * - `resource` is a top-level ResourceInfo object { url, description?, mimeType? }
+ * - Each entry in `accepts` uses `amount` (not v1's `maxAmountRequired`)
+ * - Each entry has an `extra` field for scheme-specific data
  */
 export function generateX402Requirements(
   config: PayMuxServerConfig,
@@ -40,16 +45,19 @@ export function generateX402Requirements(
 
   const requirements = {
     x402Version: 2,
+    resource: {
+      url: resource ?? '',
+      description: chargeOpts.description ?? undefined,
+    },
     accepts: [
       {
         scheme: 'exact',
         network,
-        maxAmountRequired: toBaseUnits(chargeOpts.amount),
-        resource: resource ?? '',
-        description: chargeOpts.description ?? '',
+        amount: toBaseUnits(chargeOpts.amount),
         maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
         payTo: config.x402.recipient,
         asset,
+        extra: {},
       },
     ],
   };
@@ -81,6 +89,23 @@ export async function verifyX402Payment(
     const network = chainToNetwork(config.x402?.chain ?? 'base');
     const asset = config.x402?.asset ?? USDC_ADDRESSES[network] ?? USDC_ADDRESSES['eip155:8453'];
 
+    // Use the client's `accepted` field from the payment payload when available.
+    // The x402 facilitator uses deepEqual to match paymentRequirements against the
+    // payload's accepted field. Reconstructing from config can cause mismatches.
+    // Fall back to server-constructed requirements if `accepted` is missing.
+    const clientAccepted = payload?.accepted;
+    const paymentRequirements = (clientAccepted && typeof clientAccepted === 'object' && clientAccepted.payTo === config.x402?.recipient)
+      ? clientAccepted
+      : {
+          scheme: 'exact',
+          network,
+          amount: toBaseUnits(chargeOpts.amount),
+          payTo: config.x402?.recipient,
+          asset,
+          maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
+          extra: {},
+        };
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), verifyTimeoutMs);
 
@@ -90,18 +115,9 @@ export async function verifyX402Payment(
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          x402Version: 2,
+          x402Version: payload?.x402Version ?? 2,
           paymentPayload: payload,
-          paymentRequirements: {
-            scheme: 'exact',
-            network,
-            maxAmountRequired: toBaseUnits(chargeOpts.amount),
-            payTo: config.x402?.recipient,
-            asset,
-            maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
-            resource: '',
-            description: chargeOpts.description ?? '',
-          },
+          paymentRequirements,
         }),
       });
 
@@ -156,6 +172,20 @@ export async function settleX402Payment(
     const network = chainToNetwork(config.x402?.chain ?? 'base');
     const asset = config.x402?.asset ?? USDC_ADDRESSES[network] ?? USDC_ADDRESSES['eip155:8453'];
 
+    // Use the client's `accepted` field for consistency with the verify step.
+    const clientAccepted = payload?.accepted;
+    const paymentRequirements = (clientAccepted && typeof clientAccepted === 'object' && clientAccepted.payTo === config.x402?.recipient)
+      ? clientAccepted
+      : {
+          scheme: 'exact',
+          network,
+          amount: toBaseUnits(chargeOpts.amount),
+          payTo: config.x402?.recipient,
+          asset,
+          maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
+          extra: {},
+        };
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), settleTimeoutMs);
 
@@ -173,18 +203,9 @@ export async function settleX402Payment(
         },
         signal: controller.signal,
         body: JSON.stringify({
-          x402Version: 2,
+          x402Version: payload?.x402Version ?? 2,
           paymentPayload: payload,
-          paymentRequirements: {
-            scheme: 'exact',
-            network,
-            maxAmountRequired: toBaseUnits(chargeOpts.amount),
-            payTo: config.x402?.recipient,
-            asset,
-            maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
-            resource: '',
-            description: chargeOpts.description ?? '',
-          },
+          paymentRequirements,
         }),
       });
 

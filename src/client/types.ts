@@ -65,4 +65,9 @@ export interface PayMuxFetchOptions extends RequestInit {
   protocol?: Protocol;
   /** Skip payment (useful for testing) */
   skipPayment?: boolean;
+  /**
+   * @internal Skip global spending limit checks. Used by PayMuxSession to avoid
+   * double-charging — the session's full budget is already reserved globally.
+   */
+  skipSpendingCheck?: boolean;
 }

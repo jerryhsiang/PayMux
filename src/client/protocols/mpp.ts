@@ -1,4 +1,5 @@
 import type { PaymentRequirement, PaymentResult, WalletConfig, MppReceipt } from '../../shared/types.js';
+import { base64urlDecode } from '../utils.js';
 
 /**
  * MPP payment client — wraps mppx for session-based streaming payments.
@@ -111,7 +112,7 @@ export class MppClient {
       try {
         // Payment-Receipt is base64url-encoded JSON per the MPP spec
         // Fields: { status: "success", method, reference, timestamp, externalId? }
-        const decoded = atob(receiptHeader.replace(/-/g, '+').replace(/_/g, '/'));
+        const decoded = base64urlDecode(receiptHeader);
         const parsed: unknown = JSON.parse(decoded);
         if (parsed && typeof parsed === 'object') {
           const raw = parsed as Record<string, unknown>;

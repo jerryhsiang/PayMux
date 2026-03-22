@@ -173,7 +173,7 @@ export class PayMuxClient {
   ): Promise<Response> {
     const urlString = url.toString();
     const options = init ?? {};
-    const { maxAmount, protocol, skipPayment, ...fetchInit } = options;
+    const { maxAmount, protocol, skipPayment, skipSpendingCheck, ...fetchInit } = options;
 
     if (skipPayment) {
       return globalThis.fetch(urlString, fetchInit);
@@ -201,7 +201,7 @@ export class PayMuxClient {
         this.logger.debug(`[paymux] [cache] MPP cached for ${urlString} — skipping probe`, {
           event: 'cache_hit', protocol: 'mpp', url: urlString,
         });
-        return this.mppFastPath(urlString, fetchInit, maxAmount);
+        return this.mppFastPath(urlString, fetchInit, maxAmount, skipSpendingCheck);
       }
     }
 
@@ -279,7 +279,10 @@ export class PayMuxClient {
     }
 
     // Step 4: ENFORCE SPENDING LIMITS — all checks in USD
-    // maxAmount ceiling check (USD)
+    // skipSpendingCheck: used by sessions whose budget was already reserved globally
+    const shouldCheckSpending = !skipSpendingCheck;
+
+    // maxAmount ceiling check (USD) — always enforced regardless of skipSpendingCheck
     if (maxAmount !== undefined && amountUsd > maxAmount) {
       throw new Error(
         `PayMux: Payment of $${amountUsd.toFixed(6)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
@@ -287,7 +290,9 @@ export class PayMuxClient {
     }
 
     // Per-request + per-day limits in USD (reserves amount as pending)
-    this.spendingEnforcer.check(amountUsd);
+    if (shouldCheckSpending) {
+      this.spendingEnforcer.check(amountUsd);
+    }
 
     // Step 5: Route to protocol client — release pending on failure
     let response: Response;
@@ -300,12 +305,16 @@ export class PayMuxClient {
     } catch (error) {
       // Release the pending reservation so failed payments don't
       // permanently reduce daily spending capacity
-      this.spendingEnforcer.release(amountUsd);
+      if (shouldCheckSpending) {
+        this.spendingEnforcer.release(amountUsd);
+      }
       throw error;
     }
 
     // Step 6: Record successful payment (moves from pending to confirmed)
-    this.spendingEnforcer.record(amountUsd);
+    if (shouldCheckSpending) {
+      this.spendingEnforcer.record(amountUsd);
+    }
     this.recordPayment(result);
 
     this.logger.info(
@@ -514,7 +523,8 @@ export class PayMuxClient {
   private async mppFastPath(
     url: string,
     init: RequestInit,
-    maxAmount?: number
+    maxAmount?: number,
+    skipSpendingCheck?: boolean
   ): Promise<Response> {
     if (!this.mppClient) {
       throw new Error(
@@ -547,7 +557,10 @@ export class PayMuxClient {
     );
 
     // Step 2: ENFORCE SPENDING LIMITS — all checks BEFORE payment
-    // maxAmount ceiling check (USD)
+    // skipSpendingCheck: used by sessions whose budget was already reserved globally
+    const shouldCheckSpendingFP = !skipSpendingCheck;
+
+    // maxAmount ceiling check (USD) — always enforced regardless of skipSpendingCheck
     if (maxAmount !== undefined && amountUsd > maxAmount) {
       throw new Error(
         `PayMux: Payment of $${amountUsd.toFixed(6)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
@@ -555,7 +568,9 @@ export class PayMuxClient {
     }
 
     // Per-request + per-day limits in USD (reserves amount as pending)
-    this.spendingEnforcer.check(amountUsd);
+    if (shouldCheckSpendingFP) {
+      this.spendingEnforcer.check(amountUsd);
+    }
 
     // Step 3: Pay via mppx — release pending on failure
     let response: Response;
@@ -568,14 +583,18 @@ export class PayMuxClient {
     } catch (error) {
       // Release the pending reservation so failed payments don't
       // permanently reduce daily spending capacity
-      this.spendingEnforcer.release(amountUsd);
+      if (shouldCheckSpendingFP) {
+        this.spendingEnforcer.release(amountUsd);
+      }
       throw error;
     }
 
     // If mppx got a non-402 (server changed between our probe and mppx's probe),
     // release the pending amount since no payment was made
     if (!result.receipt) {
-      this.spendingEnforcer.release(amountUsd);
+      if (shouldCheckSpendingFP) {
+        this.spendingEnforcer.release(amountUsd);
+      }
       this.logger.debug(`[paymux] [<] ${response.status} (MPP fast path — no payment on retry)`, {
         event: 'mpp_no_payment_retry', status: response.status, url,
       });
@@ -584,7 +603,9 @@ export class PayMuxClient {
     }
 
     // Step 4: Record successful payment (moves from pending to confirmed)
-    this.spendingEnforcer.record(amountUsd);
+    if (shouldCheckSpendingFP) {
+      this.spendingEnforcer.record(amountUsd);
+    }
     this.recordPayment(result);
 
     this.logger.info(

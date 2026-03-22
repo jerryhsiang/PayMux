@@ -91,21 +91,17 @@ export function createExpressCharge(
           }
 
           if (mppResult.status === 200 && mppResult.withReceipt) {
-            // Payment verified — wrap the response with Payment-Receipt header
-            const originalJson = res.json.bind(res);
-            res.json = function (data: unknown) {
-              // Create a temporary Response to let mppx attach the receipt
-              const tempResponse = new Response(JSON.stringify(data), {
-                headers: { 'Content-Type': 'application/json' },
-              });
-              const receiptedResponse = mppResult.withReceipt!(tempResponse);
-              // Copy the Payment-Receipt header to the Express response
-              const receipt = receiptedResponse.headers.get('payment-receipt');
-              if (receipt) {
-                res.setHeader('Payment-Receipt', receipt);
-              }
-              return originalJson(data);
-            } as typeof res.json;
+            // Payment verified — extract the receipt header BEFORE calling next().
+            // This ensures the Payment-Receipt header is set regardless of whether
+            // the handler calls res.json(), res.send(), res.end(), or any other method.
+            const tempResponse = new Response(null, {
+              headers: { 'Content-Type': 'application/json' },
+            });
+            const receiptedResponse = mppResult.withReceipt(tempResponse);
+            const receipt = receiptedResponse.headers.get('payment-receipt');
+            if (receipt) {
+              res.setHeader('Payment-Receipt', receipt);
+            }
             next();
             return;
           }

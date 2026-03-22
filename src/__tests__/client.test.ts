@@ -519,6 +519,7 @@ describe('PayMux client', () => {
         fetch: mockFetch ?? vi.fn().mockResolvedValue(
           new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
         ),
+        spending: { history: [] },
       };
       return new PayMuxSession(delegate, config, spendingEnforcer);
     }
@@ -551,7 +552,7 @@ describe('PayMux client', () => {
       await session.fetch('/api/data?q=foo');
       expect(mockFetch).toHaveBeenCalledWith(
         'https://api.example.com/api/data?q=foo',
-        undefined
+        expect.objectContaining({ skipSpendingCheck: true })
       );
     });
 
@@ -569,7 +570,7 @@ describe('PayMux client', () => {
       await session.fetch('https://other.example.com/data');
       expect(mockFetch).toHaveBeenCalledWith(
         'https://other.example.com/data',
-        undefined
+        expect.objectContaining({ skipSpendingCheck: true })
       );
     });
 
@@ -599,28 +600,26 @@ describe('PayMux client', () => {
       await expect(session.fetch('/data')).rejects.toThrow('Session budget exhausted');
     });
 
-    it('session budget enforcement — tracks spending from receipts', async () => {
-      // Create a mock fetch that returns a payment receipt header
-      const receiptData = {
-        status: 'success',
-        method: 'tempo',
-        reference: 'tx_123',
-        timestamp: new Date().toISOString(),
-        spent: '0.02',
+    it('session budget enforcement — tracks spending from parent history', async () => {
+      // The session now tracks spending from the parent client's payment history,
+      // not from receipt headers. This works for both x402 and MPP protocols.
+      const parentHistory: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+
+      const mockFetch = vi.fn().mockImplementation(async () => {
+        // Simulate the parent client recording a payment during fetch
+        parentHistory.push({ amount: '0.02', protocol: 'mpp', settledAt: Date.now() });
+        return new Response(JSON.stringify({ result: 'ok' }), { status: 200 });
+      });
+
+      const spendingEnforcer = new SpendingEnforcer({});
+      const delegate: SessionFetchDelegate = {
+        fetch: mockFetch,
+        spending: { history: parentHistory },
       };
-      const encodedReceipt = btoa(JSON.stringify(receiptData));
-
-      const mockFetch = vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ result: 'ok' }), {
-          status: 200,
-          headers: { 'payment-receipt': encodedReceipt },
-        })
-      );
-
-      const session = createMockSession(
+      const session = new PayMuxSession(
+        delegate,
         { url: 'https://api.example.com', budget: 1.00 },
-        undefined,
-        mockFetch
+        spendingEnforcer
       );
 
       await session.fetch('/data');
@@ -659,11 +658,11 @@ describe('PayMux client', () => {
 
       await session.close();
 
-      // The unspent $3.00 should be released back to the global enforcer.
-      // Global enforcer should now have $3.00 less pending.
+      // close() records $2.00 spent (pending -> confirmed) and releases $3.00 unspent.
       const stats = enforcer.stats();
-      // pending was 5.00, close() released 3.00, so pending should be 2.00
-      expect(stats.pendingSpend).toBe(2.00);
+      expect(stats.pendingSpend).toBe(0);
+      expect(stats.dailySpend).toBe(2.00);
+      expect(stats.totalSpent).toBe(2.00);
     });
 
     it('session.close() is idempotent — calling twice does not double-release', async () => {
@@ -681,8 +680,9 @@ describe('PayMux client', () => {
       await session.close(); // Second close should be a no-op
 
       const stats = enforcer.stats();
-      // Only released $4.00 once, so pending = 5.00 - 4.00 = 1.00
-      expect(stats.pendingSpend).toBe(1.00);
+      // close() recorded $1.00 spent and released $4.00 unspent (once, idempotent).
+      expect(stats.pendingSpend).toBe(0);
+      expect(stats.dailySpend).toBe(1.00);
     });
 
     it('session.fetch() throws after close', async () => {

@@ -100,7 +100,7 @@ describe('E2E: Express server with x402 payments', () => {
     expect(decoded.accepts[0].payTo).toBe('0x742d35Cc6634c0532925a3b844bC9e7595F8fE00');
 
     // Amount should be in base units (0.01 * 10^6 = 10000)
-    expect(decoded.accepts[0].maxAmountRequired).toBe('10000');
+    expect(decoded.accepts[0].amount).toBe('10000');
 
     // Asset should be USDC contract address, not "USDC" string
     expect(decoded.accepts[0].asset).toMatch(/^0x[a-fA-F0-9]{40}$/);
@@ -178,14 +178,14 @@ describe('E2E: Express server with multiple price tiers', () => {
     const response = await fetch(`${serverUrl}/api/cheap`);
     const decoded = JSON.parse(atob(response.headers.get('payment-required')!));
     // 0.001 * 10^6 = 1000
-    expect(decoded.accepts[0].maxAmountRequired).toBe('1000');
+    expect(decoded.accepts[0].amount).toBe('1000');
   });
 
   it('expensive endpoint returns correct amount in base units', async () => {
     const response = await fetch(`${serverUrl}/api/expensive`);
     const decoded = JSON.parse(atob(response.headers.get('payment-required')!));
     // 10.00 * 10^6 = 10000000
-    expect(decoded.accepts[0].maxAmountRequired).toBe('10000000');
+    expect(decoded.accepts[0].amount).toBe('10000000');
   });
 });
 
@@ -412,7 +412,7 @@ describe('E2E: Hono server with x402 payments', () => {
     expect(decoded.accepts[0].network).toBe('eip155:8453'); // base mainnet
     expect(decoded.accepts[0].payTo).toBe('0x742d35Cc6634c0532925a3b844bC9e7595F8fE00');
     // 0.05 * 10^6 = 50000
-    expect(decoded.accepts[0].maxAmountRequired).toBe('50000');
+    expect(decoded.accepts[0].amount).toBe('50000');
   });
 
   it('agent detects x402 from Hono server 402 response', async () => {
@@ -478,7 +478,7 @@ describe('E2E: Express server with dual-protocol (x402 + MPP)', () => {
 
     const decoded = JSON.parse(atob(paymentRequired!));
     expect(decoded.x402Version).toBe(2);
-    expect(decoded.accepts[0].maxAmountRequired).toBe('20000'); // 0.02 * 10^6
+    expect(decoded.accepts[0].amount).toBe('20000'); // 0.02 * 10^6
   });
 
   it('402 response includes both protocol headers', async () => {
