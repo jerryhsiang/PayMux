@@ -15,6 +15,26 @@ const USDC_ADDRESSES: Record<string, string> = {
   'eip155:11155111': '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238', // Ethereum Sepolia
 };
 
+/**
+ * EIP-712 domain parameters for USDC by chain.
+ *
+ * Required by @x402/core's exact EVM scheme for EIP-3009 transferWithAuthorization
+ * signing. Without `name` and `version` in the `extra` field, the client's
+ * `createPaymentPayload()` throws:
+ *   "EIP-712 domain parameters (name, version) are required"
+ *
+ * Values sourced from the @x402/evm exact scheme's stablecoin configuration.
+ * The `name` is the token's ERC-20 name() and `version` is its EIP-712 domain version.
+ */
+const USDC_EIP712_DOMAIN: Record<string, { name: string; version: string }> = {
+  'eip155:8453':     { name: 'USD Coin', version: '2' },   // Base mainnet
+  'eip155:84532':    { name: 'USDC',     version: '2' },   // Base Sepolia
+  'eip155:137':      { name: 'USD Coin', version: '2' },   // Polygon mainnet
+  'eip155:80002':    { name: 'USD Coin', version: '2' },   // Polygon Amoy
+  'eip155:1':        { name: 'USD Coin', version: '2' },   // Ethereum mainnet
+  'eip155:11155111': { name: 'USDC',     version: '2' },   // Ethereum Sepolia
+};
+
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
 
 /**
@@ -43,6 +63,10 @@ export function generateX402Requirements(
   const network = chainToNetwork(chain);
   const asset = config.x402.asset ?? USDC_ADDRESSES[network] ?? USDC_ADDRESSES['eip155:8453'];
 
+  // EIP-712 domain params are required by @x402/core's exact EVM scheme for signing.
+  // Without these, clients using @x402/core >= 2.7.0 throw at createPaymentPayload().
+  const eip712Domain = USDC_EIP712_DOMAIN[network];
+
   const requirements = {
     x402Version: 2,
     resource: {
@@ -57,7 +81,9 @@ export function generateX402Requirements(
         maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
         payTo: config.x402.recipient,
         asset,
-        extra: {},
+        extra: {
+          ...(eip712Domain && { name: eip712Domain.name, version: eip712Domain.version }),
+        },
       },
     ],
   };
@@ -94,6 +120,7 @@ export async function verifyX402Payment(
     // payload's accepted field. Reconstructing from config can cause mismatches.
     // Fall back to server-constructed requirements if `accepted` is missing.
     const clientAccepted = payload?.accepted;
+    const eip712DomainVerify = USDC_EIP712_DOMAIN[network];
     const paymentRequirements = (clientAccepted && typeof clientAccepted === 'object' && clientAccepted.payTo === config.x402?.recipient)
       ? clientAccepted
       : {
@@ -103,7 +130,9 @@ export async function verifyX402Payment(
           payTo: config.x402?.recipient,
           asset,
           maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
-          extra: {},
+          extra: {
+            ...(eip712DomainVerify && { name: eip712DomainVerify.name, version: eip712DomainVerify.version }),
+          },
         };
 
     const controller = new AbortController();
@@ -174,6 +203,7 @@ export async function settleX402Payment(
 
     // Use the client's `accepted` field for consistency with the verify step.
     const clientAccepted = payload?.accepted;
+    const eip712DomainSettle = USDC_EIP712_DOMAIN[network];
     const paymentRequirements = (clientAccepted && typeof clientAccepted === 'object' && clientAccepted.payTo === config.x402?.recipient)
       ? clientAccepted
       : {
@@ -183,7 +213,9 @@ export async function settleX402Payment(
           payTo: config.x402?.recipient,
           asset,
           maxTimeoutSeconds: chargeOpts.maxTimeoutSeconds ?? 120,
-          extra: {},
+          extra: {
+            ...(eip712DomainSettle && { name: eip712DomainSettle.name, version: eip712DomainSettle.version }),
+          },
         };
 
     const controller = new AbortController();

@@ -54,14 +54,14 @@ describe('PayMuxServer', () => {
     it('rejects mpp.tempoRecipient that is a placeholder', () => {
       expect(() => PayMuxServer.create({
         accept: ['mpp'],
-        mpp: { secretKey: 'test-key', tempoRecipient: '0xYourWalletAddress' as `0x${string}` },
+        mpp: { secretKey: 'dGVzdC1rZXktdGhhdC1pcy1sb25nLWVub3VnaC1mb3ItaG1hYw==', tempoRecipient: '0xYourWalletAddress' as `0x${string}` },
       })).toThrow('not a valid Ethereum address');
     });
 
     it('rejects mpp.tempoRecipient that is too short', () => {
       expect(() => PayMuxServer.create({
         accept: ['mpp'],
-        mpp: { secretKey: 'test-key', tempoRecipient: '0xABC' as `0x${string}` },
+        mpp: { secretKey: 'dGVzdC1rZXktdGhhdC1pcy1sb25nLWVub3VnaC1mb3ItaG1hYw==', tempoRecipient: '0xABC' as `0x${string}` },
       })).toThrow('not a valid Ethereum address');
     });
 
@@ -117,7 +117,7 @@ describe('PayMuxServer', () => {
       const payments = PayMuxServer.create({
         accept: ['x402', 'mpp'],
         x402: { recipient: '0x0000000000000000000000000000000000000001' },
-        mpp: { secretKey: 'test-key', tempoRecipient: '0x0000000000000000000000000000000000000002' },
+        mpp: { secretKey: 'dGVzdC1rZXktdGhhdC1pcy1sb25nLWVub3VnaC1mb3ItaG1hYw==', tempoRecipient: '0x0000000000000000000000000000000000000002' },
       });
       expect(payments.protocols).toEqual(['x402', 'mpp']);
     });

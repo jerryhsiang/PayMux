@@ -154,6 +154,13 @@ export class PayMuxServer {
             'Generate one with: crypto.randomBytes(32).toString("base64")'
         );
       }
+      if (config.mpp.secretKey.length < 32) {
+        throw new Error(
+          'PayMux Server: mpp.secretKey must be at least 32 characters for secure HMAC challenge binding. ' +
+            `Got ${config.mpp.secretKey.length} characters. ` +
+            'Generate one with: crypto.randomBytes(32).toString("base64")'
+        );
+      }
     }
 
     // Validate Ethereum addresses are real, not placeholders
