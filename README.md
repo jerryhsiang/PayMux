@@ -152,30 +152,6 @@ All chains use USDC with correct contract addresses.
 
 ---
 
-## Roadmap
-
-- [x] Market analysis and architecture design
-- [x] Client SDK -- `agent.fetch()` with multi-protocol auto-detection
-- [x] Server middleware -- accept x402 + MPP payments with one line
-- [x] x402 protocol support (Coinbase/Cloudflare)
-- [x] MPP protocol support (Stripe/Tempo)
-- [x] Spending controls (per-request, per-day limits)
-- [x] Cloudflare Workers deploy template
-- [ ] Service directory with quality scoring
-- [ ] MCP integration for agent tool discovery
-- [ ] Card payments via Visa TAP + mpp-card
-- [ ] Python SDK
-
----
-
-## Status
-
-**v0.1.0** -- x402 and MPP protocol support on both client and server. Multi-protocol auto-detection and routing. Spending controls with concurrency safety. Express, Hono, and Cloudflare Workers middleware.
-
-One `fetch()`. Two protocols. Zero code changes between them.
-
----
-
 ## License
 
 MIT License. See [LICENSE](./LICENSE).
