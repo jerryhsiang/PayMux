@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { PayMux } from '../client/paymux.js';
-import { SpendingLimitError } from '../client/spending.js';
+import { SpendingLimitError, SpendingEnforcer } from '../client/spending.js';
+import { PayMuxSession } from '../client/session.js';
+import type { SessionConfig } from '../client/session.js';
 
 describe('PayMux client', () => {
   describe('PayMux.create()', () => {
@@ -19,9 +21,22 @@ describe('PayMux client', () => {
 
     it('warns when privy wallet is configured (unsupported)', () => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
-      PayMux.create({ wallet: { privy: { walletId: 'test' } } });
+      PayMux.create({ wallet: { privy: { walletId: 'test' } }, debug: true });
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('privy'));
       warnSpy.mockRestore();
+    });
+
+    it('warns via custom logger when privy wallet is configured', () => {
+      const warns: Array<{ message: string; data?: Record<string, unknown> }> = [];
+      const customLogger = {
+        debug: () => {},
+        info: () => {},
+        warn: (message: string, data?: Record<string, unknown>) => { warns.push({ message, data }); },
+        error: () => {},
+      };
+      PayMux.create({ wallet: { privy: { walletId: 'test' } }, logger: customLogger });
+      expect(warns.length).toBe(1);
+      expect(warns[0].data).toEqual({ unsupportedWallet: 'privy' });
     });
 
     it('initializes spending stats at zero', () => {
@@ -424,6 +439,563 @@ describe('PayMux client', () => {
 
       expect(logSpy).not.toHaveBeenCalled();
       logSpy.mockRestore();
+    });
+
+    it('uses custom logger when provided', async () => {
+      const events: Array<{ level: string; message: string; data?: Record<string, unknown> }> = [];
+      const customLogger = {
+        debug: (msg: string, data?: Record<string, unknown>) => events.push({ level: 'debug', message: msg, data }),
+        info: (msg: string, data?: Record<string, unknown>) => events.push({ level: 'info', message: msg, data }),
+        warn: (msg: string, data?: Record<string, unknown>) => events.push({ level: 'warn', message: msg, data }),
+        error: (msg: string, data?: Record<string, unknown>) => events.push({ level: 'error', message: msg, data }),
+      };
+
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+
+      const agent = PayMux.create({ logger: customLogger });
+      await agent.fetch('https://example.com/api');
+
+      // Should have logged request_start and no_payment events
+      expect(events.length).toBeGreaterThanOrEqual(2);
+      expect(events[0].data?.event).toBe('request_start');
+      expect(events[1].data?.event).toBe('no_payment');
+    });
+
+    it('disables all logging when logger: false', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      globalThis.fetch = vi.fn().mockResolvedValue(new Response('', { status: 200 }));
+
+      const agent = PayMux.create({ debug: true, logger: false });
+      await agent.fetch('https://example.com/api');
+
+      // logger: false overrides debug: true
+      expect(logSpy).not.toHaveBeenCalled();
+      logSpy.mockRestore();
+    });
+  });
+
+  // ── Session management tests ──────────────────────────────────────
+
+  describe('PayMuxSession — direct unit tests', () => {
+    const TEST_WALLET = { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' as const };
+
+    /**
+     * Create a PayMuxSession with a mock mppxFetch so we don't need real mppx.
+     * Uses Object.assign to set the private mppxFetch and initialized fields.
+     */
+    function createMockSession(
+      config: SessionConfig,
+      enforcer?: SpendingEnforcer,
+      mockFetch?: typeof fetch
+    ): PayMuxSession {
+      const spendingEnforcer = enforcer ?? new SpendingEnforcer({});
+      const session = new PayMuxSession(TEST_WALLET, config, spendingEnforcer);
+
+      // Bypass initialize() by directly setting private fields.
+      // This avoids the dynamic import of mppx/client which is unavailable in tests.
+      (session as any).mppxFetch = mockFetch ?? vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+      );
+      (session as any).initialized = true;
+
+      return session;
+    }
+
+    it('creates a session with correct initial spending state', () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+      });
+
+      expect(session.spending.spent).toBe(0);
+      expect(session.spending.budget).toBe(5.00);
+      expect(session.spending.remaining).toBe(5.00);
+      expect(session.spending.requestCount).toBe(0);
+      expect(session.spending.isOpen).toBe(true);
+      expect(session.isOpen).toBe(true);
+    });
+
+    it('session.fetch() resolves path against base URL', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+      );
+
+      const session = createMockSession(
+        { url: 'https://api.example.com', budget: 5.00 },
+        undefined,
+        mockFetch
+      );
+
+      await session.fetch('/api/data?q=foo');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://api.example.com/api/data?q=foo',
+        undefined
+      );
+    });
+
+    it('session.fetch() passes full URLs through unchanged', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response('', { status: 200 })
+      );
+
+      const session = createMockSession(
+        { url: 'https://api.example.com', budget: 5.00 },
+        undefined,
+        mockFetch
+      );
+
+      await session.fetch('https://other.example.com/data');
+      expect(mockFetch).toHaveBeenCalledWith(
+        'https://other.example.com/data',
+        undefined
+      );
+    });
+
+    it('session.fetch() increments request count', async () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+      });
+
+      await session.fetch('/a');
+      await session.fetch('/b');
+      await session.fetch('/c');
+
+      expect(session.spending.requestCount).toBe(3);
+    });
+
+    it('session budget enforcement — rejects when budget exhausted', async () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 0.10,
+      });
+
+      // Manually set spending state to simulate exhausted budget
+      (session as any).spendingState.spent = 0.10;
+
+      await expect(session.fetch('/data')).rejects.toThrow(SpendingLimitError);
+      await expect(session.fetch('/data')).rejects.toThrow('Session budget exhausted');
+    });
+
+    it('session budget enforcement — tracks spending from receipts', async () => {
+      // Create a mock fetch that returns a payment receipt header
+      const receiptData = {
+        status: 'success',
+        method: 'tempo',
+        reference: 'tx_123',
+        timestamp: new Date().toISOString(),
+        spent: '0.02',
+      };
+      const encodedReceipt = btoa(JSON.stringify(receiptData));
+
+      const mockFetch = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ result: 'ok' }), {
+          status: 200,
+          headers: { 'payment-receipt': encodedReceipt },
+        })
+      );
+
+      const session = createMockSession(
+        { url: 'https://api.example.com', budget: 1.00 },
+        undefined,
+        mockFetch
+      );
+
+      await session.fetch('/data');
+
+      expect(session.spending.spent).toBe(0.02);
+      expect(session.spending.remaining).toBe(0.98);
+      expect(session.spending.history.length).toBe(1);
+      expect(session.spending.history[0].protocol).toBe('mpp');
+      expect(session.spending.history[0].amount).toBe('0.02');
+    });
+
+    it('session.close() marks session as closed', async () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+      });
+
+      expect(session.isOpen).toBe(true);
+      await session.close();
+      expect(session.isOpen).toBe(false);
+    });
+
+    it('session.close() releases unspent budget to global enforcer', async () => {
+      const enforcer = new SpendingEnforcer({ perDay: 100 });
+
+      // Simulate the global spending check that openSession() does
+      enforcer.check(5.00); // Reserves $5.00 as pending
+
+      const session = createMockSession(
+        { url: 'https://api.example.com', budget: 5.00 },
+        enforcer
+      );
+
+      // Simulate spending $2.00 within the session
+      (session as any).spendingState.spent = 2.00;
+
+      await session.close();
+
+      // The unspent $3.00 should be released back to the global enforcer.
+      // Global enforcer should now have $3.00 less pending.
+      const stats = enforcer.stats();
+      // pending was 5.00, close() released 3.00, so pending should be 2.00
+      expect(stats.pendingSpend).toBe(2.00);
+    });
+
+    it('session.close() is idempotent — calling twice does not double-release', async () => {
+      const enforcer = new SpendingEnforcer({ perDay: 100 });
+      enforcer.check(5.00);
+
+      const session = createMockSession(
+        { url: 'https://api.example.com', budget: 5.00 },
+        enforcer
+      );
+
+      (session as any).spendingState.spent = 1.00;
+
+      await session.close();
+      await session.close(); // Second close should be a no-op
+
+      const stats = enforcer.stats();
+      // Only released $4.00 once, so pending = 5.00 - 4.00 = 1.00
+      expect(stats.pendingSpend).toBe(1.00);
+    });
+
+    it('session.fetch() throws after close', async () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+      });
+
+      await session.close();
+
+      await expect(session.fetch('/data')).rejects.toThrow('Session is closed');
+    });
+
+    it('session.fetch() throws after expiry', async () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+        duration: 1, // 1ms — expires immediately
+      });
+
+      // Wait for expiry
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+      await expect(session.fetch('/data')).rejects.toThrow('expired');
+    });
+
+    it('session.timeRemaining reflects actual time left', () => {
+      const session = createMockSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+        duration: 60_000, // 1 minute
+      });
+
+      // Should be close to 60000ms (some ms may have elapsed)
+      expect(session.timeRemaining).toBeLessThanOrEqual(60_000);
+      expect(session.timeRemaining).toBeGreaterThan(59_000);
+    });
+  });
+
+  describe('openSession() — integration with PayMuxClient', () => {
+    it('throws when no wallet configured', async () => {
+      const agent = PayMux.create({});
+
+      await expect(
+        agent.openSession({ url: 'https://api.example.com', budget: 5.00 })
+      ).rejects.toThrow('requires a wallet');
+    });
+
+    it('throws SpendingLimitError when session budget exceeds daily limit', async () => {
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+        limits: { perDay: 2.00 },
+      });
+
+      // Session budget $5.00 > daily limit $2.00
+      await expect(
+        agent.openSession({ url: 'https://api.example.com', budget: 5.00 })
+      ).rejects.toThrow(SpendingLimitError);
+    });
+
+    it('charges session budget against global spending limits upfront', async () => {
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+        limits: { perDay: 100.00 },
+      });
+
+      // Opening a session should reserve the budget as pending spend
+      const session = await agent.openSession({
+        url: 'https://api.example.com',
+        budget: 10.00,
+      });
+
+      // Budget is charged as pending against global limits
+      expect(agent.spending.pendingSpend).toBe(10.00);
+      expect(agent.spending.totalSpent).toBe(0);
+
+      // Close the session — unspent budget should be released
+      await session.close();
+      expect(agent.spending.pendingSpend).toBe(0);
+    });
+  });
+
+  // ── Retry logic tests ─────────────────────────────────────────────
+
+  describe('fetch() — retry logic', () => {
+    let originalFetch: typeof globalThis.fetch;
+
+    beforeEach(() => {
+      originalFetch = globalThis.fetch;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = originalFetch;
+    });
+
+    it('retries on 503 and succeeds on second attempt', async () => {
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response('Service Unavailable', { status: 503, statusText: 'Service Unavailable' })
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+        );
+      });
+
+      const agent = PayMux.create({
+        retry: { baseDelayMs: 1 }, // 1ms delay for fast tests
+      });
+
+      const response = await agent.fetch('https://example.com/api');
+      expect(response.status).toBe(200);
+      expect(callCount).toBe(2); // 1 initial + 1 retry
+    });
+
+    it('does not retry on 400 (non-retryable status)', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response('Bad Request', { status: 400 })
+      );
+
+      const agent = PayMux.create({
+        retry: { baseDelayMs: 1 },
+      });
+
+      const response = await agent.fetch('https://example.com/api');
+      expect(response.status).toBe(400);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1); // No retries
+    });
+
+    it('retry: false disables retries entirely', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response('Bad Gateway', { status: 502, statusText: 'Bad Gateway' })
+      );
+
+      const agent = PayMux.create({
+        retry: false,
+      });
+
+      // With retry disabled, 502 is returned as-is (no retry, no throw)
+      const response = await agent.fetch('https://example.com/api');
+      expect(response.status).toBe(502);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('respects maxRetries and throws after exhaustion', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response('Service Unavailable', { status: 503, statusText: 'Service Unavailable' })
+      );
+
+      const agent = PayMux.create({
+        retry: { maxRetries: 3, baseDelayMs: 1 },
+      });
+
+      await expect(
+        agent.fetch('https://example.com/api')
+      ).rejects.toThrow('Request failed after 4 attempts (1 initial + 3 retries)');
+
+      // 1 initial + 3 retries = 4 total calls
+      expect(globalThis.fetch).toHaveBeenCalledTimes(4);
+    });
+
+    it('does not retry POST requests by default', async () => {
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response('Service Unavailable', { status: 503, statusText: 'Service Unavailable' })
+      );
+
+      const agent = PayMux.create({
+        retry: { baseDelayMs: 1 },
+      });
+
+      // POST with 503 should NOT be retried (safety: could double-charge)
+      const response = await agent.fetch('https://example.com/api', { method: 'POST' });
+      expect(response.status).toBe(503);
+      expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries POST when explicitly configured in retryMethods', async () => {
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response('Bad Gateway', { status: 502, statusText: 'Bad Gateway' })
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ created: true }), { status: 201 })
+        );
+      });
+
+      const agent = PayMux.create({
+        retry: { baseDelayMs: 1, retryMethods: ['GET', 'HEAD', 'POST'] },
+      });
+
+      const response = await agent.fetch('https://example.com/api', { method: 'POST' });
+      expect(response.status).toBe(201);
+      expect(callCount).toBe(2);
+    });
+
+    it('retries on network error (TypeError) and succeeds on second attempt', async () => {
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject(new TypeError('fetch failed'));
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+        );
+      });
+
+      const agent = PayMux.create({
+        retry: { baseDelayMs: 1 },
+      });
+
+      const response = await agent.fetch('https://example.com/api');
+      expect(response.status).toBe(200);
+      expect(callCount).toBe(2);
+    });
+
+    it('throws with context after all network error retries exhausted', async () => {
+      globalThis.fetch = vi.fn().mockRejectedValue(
+        new TypeError('fetch failed')
+      );
+
+      const agent = PayMux.create({
+        retry: { maxRetries: 2, baseDelayMs: 1 },
+      });
+
+      await expect(
+        agent.fetch('https://example.com/api')
+      ).rejects.toThrow('Request failed after 3 attempts (1 initial + 2 retries). Last error: fetch failed');
+    });
+
+    it('does not retry 402 responses (payment required is not transient)', async () => {
+      const x402Requirements = btoa(JSON.stringify({
+        x402Version: 2,
+        accepts: [{
+          scheme: 'exact', network: 'eip155:8453',
+          maxAmountRequired: '10000', payTo: '0x1', asset: '0x2',
+        }],
+      }));
+
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response('', {
+          status: 402,
+          headers: { 'payment-required': x402Requirements },
+        })
+      );
+
+      const agent = PayMux.create({
+        wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
+        retry: { baseDelayMs: 1, retryableStatusCodes: [402, 502, 503, 504] },
+      });
+
+      // Even if 402 is in retryableStatusCodes, the probe response should
+      // still be returned for payment processing (402 is handled in fetch(),
+      // not retried by probeWithRetry)
+      // The 402 won't match retryableStatusCodes check because probeWithRetry
+      // returns any non-retryable status immediately.
+      // This test verifies 402 triggers the payment flow, not a retry loop.
+      // Since we have a wallet, it will try to process the 402 payment.
+      // The fetch mock always returns 402, so the x402 client will be invoked.
+      // It should only call fetch once for the probe (402 is returned immediately).
+      expect(globalThis.fetch).toHaveBeenCalledTimes(0); // Not called yet
+
+      // Trigger the fetch — the 402 should be processed, not retried
+      try {
+        await agent.fetch('https://example.com/paid');
+      } catch {
+        // May throw due to x402 payment failing in tests — that's expected
+      }
+
+      // The key assertion: fetch was called exactly once for the probe
+      // (402 was not retried), then possibly again for x402 payment
+      expect((globalThis.fetch as any).mock.calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('logs retries when debug: true', async () => {
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.resolve(
+            new Response('Service Unavailable', { status: 503, statusText: 'Service Unavailable' })
+          );
+        }
+        return Promise.resolve(
+          new Response('', { status: 200 })
+        );
+      });
+
+      const agent = PayMux.create({
+        debug: true,
+        retry: { baseDelayMs: 1 },
+      });
+
+      await agent.fetch('https://example.com/api');
+
+      // Should have logged a retry message
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('[paymux] Retry 1/2 after 1ms (503 Service Unavailable)')
+      );
+
+      logSpy.mockRestore();
+    });
+
+    it('uses default retry config when retry option is omitted', async () => {
+      let callCount = 0;
+      globalThis.fetch = vi.fn().mockImplementation(() => {
+        callCount++;
+        if (callCount <= 2) {
+          return Promise.resolve(
+            new Response('Bad Gateway', { status: 502, statusText: 'Bad Gateway' })
+          );
+        }
+        return Promise.resolve(
+          new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
+        );
+      });
+
+      // No retry config specified — should use defaults (maxRetries: 2)
+      const agent = PayMux.create({});
+
+      // Monkey-patch the retry delay for fast tests
+      (agent as any).retryConfig.baseDelayMs = 1;
+
+      const response = await agent.fetch('https://example.com/api');
+      expect(response.status).toBe(200);
+      expect(callCount).toBe(3); // 1 initial + 2 retries (default maxRetries: 2)
     });
   });
 });

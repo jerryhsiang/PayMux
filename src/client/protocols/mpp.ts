@@ -12,8 +12,12 @@ import type { PaymentRequirement, PaymentResult, WalletConfig, MppReceipt } from
 export class MppClient {
   private mppxFetch: typeof fetch | null = null;
   private initialized = false;
+  /** Timeout in ms for mppx payment calls (default: 30s) */
+  private paymentTimeoutMs: number;
 
-  constructor(private walletConfig: WalletConfig) {}
+  constructor(private walletConfig: WalletConfig, paymentTimeoutMs?: number) {
+    this.paymentTimeoutMs = paymentTimeoutMs ?? 30_000;
+  }
 
   /**
    * Lazily initialize mppx client with polyfill: false (scoped fetch, no global patching).
@@ -75,7 +79,22 @@ export class MppClient {
     //   4. Signs payment on Tempo chain
     //   5. Retries with Authorization: Payment <credential>
     //   6. Returns the paid response with Payment-Receipt header
-    const response = await this.mppxFetch(url, init);
+    //
+    // Timeout: mppx.fetch is a wrapped fetch that may not support AbortSignal,
+    // so we use Promise.race to enforce a hard timeout. If the Tempo chain or
+    // the mppx server hangs, the agent won't block indefinitely.
+    const timeoutMs = this.paymentTimeoutMs;
+    const response = await Promise.race([
+      this.mppxFetch(url, init),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(
+            `PayMux: MPP payment timed out after ${timeoutMs}ms. The Tempo chain may be unreachable.`
+          )),
+          timeoutMs,
+        )
+      ),
+    ]);
 
     if (response.status === 402) {
       throw new Error(

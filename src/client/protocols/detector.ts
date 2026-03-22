@@ -1,5 +1,5 @@
 import type { PaymentRequirement, Protocol } from '../../shared/types.js';
-import { fromBaseUnits } from '../utils.js';
+import { fromBaseUnits, mppAmountToUsd } from '../utils.js';
 
 /**
  * Header names used by payment protocols
@@ -216,10 +216,14 @@ function parseMppChallenge(
   const amount = String(requestData?.amount ?? params.amount ?? '0');
   const currency = String(requestData?.currency ?? params.currency ?? 'USD');
 
-  // MPP amounts are in human-readable form (e.g., "0.05" = $0.05 USD),
-  // NOT in base units like x402. Parse directly to USD.
-  const parsed = parseFloat(amount);
-  const amountUsd = Number.isFinite(parsed) ? parsed : undefined;
+  // MPP amount interpretation depends on the currency field:
+  // - Token address (e.g., "0x20c0..."): amount is in base units, convert via token decimals.
+  //   Real mppx servers send the token contract address as currency and base units as amount.
+  //   Example: amount="10000", currency="0x20c0..." -> 10000 / 10^6 = $0.01
+  // - Fiat string (e.g., "USD"): amount is human-readable, parse directly.
+  //   Hand-crafted or demo challenges use this format for backward compatibility.
+  //   Example: amount="0.05", currency="USD" -> $0.05
+  const amountUsd = mppAmountToUsd(amount, currency);
 
   return {
     protocol: 'mpp',

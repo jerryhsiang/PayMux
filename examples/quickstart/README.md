@@ -145,16 +145,25 @@ PRIVATE_KEY=0x... npm run agent
 
 Server config for MPP:
 
+```bash
+# Generate your MPP secret key once:
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+# Add it to your environment:
+export MPP_SECRET_KEY="<the generated key>"
+```
+
 ```typescript
 const payments = PayMuxServer.create({
   accept: ['x402', 'mpp'],
   x402: { recipient: '0x...', chain: 'base-sepolia' },
   mpp: {
-    secretKey: crypto.randomBytes(32).toString('base64'),
+    secretKey: process.env.MPP_SECRET_KEY!,
     tempoRecipient: '0x...',
     testnet: true,
   },
 });
 ```
+
+> **Note:** The `secretKey` must persist across server restarts. Never use `crypto.randomBytes()` inline — all in-flight payment challenges become invalid if the key changes. See [MPP Configuration](../../README.md#mpp-configuration) in the main README for details.
 
 The agent code is identical — PayMux auto-detects the protocol.

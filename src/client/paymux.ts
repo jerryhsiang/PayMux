@@ -1,11 +1,15 @@
 import type { PayMuxConfig, PayMuxFetchOptions } from './types.js';
 import type { PaymentRequirement, PaymentResult, SpendingLimits, Protocol } from '../shared/types.js';
+import type { PayMuxLogger } from './logger.js';
+import { resolveLogger } from './logger.js';
 import { detectProtocol, selectBestRequirement } from './protocols/detector.js';
 import { X402Client } from './protocols/x402.js';
 import { MppClient } from './protocols/mpp.js';
 import { SpendingEnforcer } from './spending.js';
-import { verifyAmountConsistency } from './utils.js';
+import { verifyAmountConsistency, getTokenName } from './utils.js';
 import { probeMppAmount } from './protocols/mpp-probe.js';
+import { PayMuxSession } from './session.js';
+import type { SessionConfig } from './session.js';
 
 /**
  * Cached protocol detection result for a URL.
@@ -84,8 +88,10 @@ export class PayMuxClient {
   private mppClient: MppClient | null = null;
   private spendingEnforcer: SpendingEnforcer;
   private config: PayMuxConfig;
+  private logger: PayMuxLogger;
   private paymentHistory: PaymentResult[] = [];
   private static readonly MAX_HISTORY = 10000;
+  private activeSessions: PayMuxSession[] = [];
 
   /**
    * Protocol cache: maps URL origins+pathnames to detected protocols.
@@ -106,17 +112,39 @@ export class PayMuxClient {
   private static readonly PROTOCOL_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
   private static readonly MAX_CACHE_ENTRIES = 1000;
 
+  /** Resolved retry config. null means retries are disabled. */
+  private retryConfig: {
+    maxRetries: number;
+    baseDelayMs: number;
+    retryableStatusCodes: number[];
+    retryMethods: string[];
+  } | null;
+
   constructor(config: PayMuxConfig) {
     this.config = config;
+    this.logger = resolveLogger({ debug: config.debug, logger: config.logger });
     this.spendingEnforcer = new SpendingEnforcer(config.limits ?? {});
+
+    // Resolve retry config
+    if (config.retry === false) {
+      this.retryConfig = null;
+    } else {
+      const rc = config.retry ?? {};
+      this.retryConfig = {
+        maxRetries: rc.maxRetries ?? 2,
+        baseDelayMs: rc.baseDelayMs ?? 1000,
+        retryableStatusCodes: rc.retryableStatusCodes ?? [502, 503, 504],
+        retryMethods: (rc.retryMethods ?? ['GET', 'HEAD']).map(m => m.toUpperCase()),
+      };
+    }
 
     if (config.wallet?.privateKey) {
       this.x402Client = new X402Client(config.wallet);
       this.mppClient = new MppClient(config.wallet);
     } else if (config.wallet?.privy || config.wallet?.coinbase) {
-      console.warn(
-        '[paymux] Warning: wallet.privy and wallet.coinbase are not yet supported. ' +
-          'Only wallet.privateKey is currently implemented.'
+      this.logger.warn(
+        '[paymux] [warn] wallet.privy and wallet.coinbase are not yet supported. Only wallet.privateKey is currently implemented.',
+        { unsupportedWallet: config.wallet.privy ? 'privy' : 'coinbase' }
       );
     }
   }
@@ -139,7 +167,9 @@ export class PayMuxClient {
       return globalThis.fetch(urlString, fetchInit);
     }
 
-    this.log(`[paymux] [>] ${fetchInit.method ?? 'GET'} ${urlString}`);
+    this.logger.debug(`[paymux] [>] ${fetchInit.method ?? 'GET'} ${urlString}`, {
+      event: 'request_start', method: fetchInit.method ?? 'GET', url: urlString,
+    });
 
     // ── MPP fast path: skip full protocol detection for cached MPP URLs ─
     // After the first request to a URL detects MPP, we cache the mapping.
@@ -156,7 +186,9 @@ export class PayMuxClient {
     if (!protocol) {
       const cached = this.getCachedProtocol(urlString);
       if (cached === 'mpp') {
-        this.log(`[paymux] [cache] MPP cached for ${urlString} — skipping probe`);
+        this.logger.debug(`[paymux] [cache] MPP cached for ${urlString} — skipping probe`, {
+          event: 'cache_hit', protocol: 'mpp', url: urlString,
+        });
         return this.mppFastPath(urlString, fetchInit, maxAmount);
       }
     }
@@ -164,24 +196,31 @@ export class PayMuxClient {
     // ── Standard path: probe first, then route ────────────────────────
 
     // Step 1: Probe request to detect if payment is needed + which protocol
-    const probeResponse = await globalThis.fetch(urlString, fetchInit);
+    // Retries on transient network errors (only for safe HTTP methods).
+    const probeResponse = await this.probeWithRetry(urlString, fetchInit);
 
     // Step 2: If not 402, return immediately (no payment needed)
     if (probeResponse.status !== 402) {
-      this.log(`[paymux] [<] ${probeResponse.status} (no payment required)`);
+      this.logger.debug(`[paymux] [<] ${probeResponse.status} (no payment required)`, {
+        event: 'no_payment', status: probeResponse.status, url: urlString,
+      });
       // If this URL was cached as a payment URL but now returns non-402,
       // evict the stale cache entry so we don't keep hitting the fast path
       this.protocolCache.delete(this.getCacheKey(urlString));
       return probeResponse;
     }
 
-    this.log(`[paymux] [<] 402 Payment Required — detecting protocol...`);
+    this.logger.debug(`[paymux] [<] 402 Payment Required — detecting protocol...`, {
+      event: 'payment_required', status: 402, url: urlString,
+    });
 
     // Step 3: Detect protocol from 402 response headers/body
     const requirements = await detectProtocol(probeResponse);
 
     if (requirements.length === 0) {
-      this.log(`[paymux] [err] Could not detect payment protocol`);
+      this.logger.error(`[paymux] [err] Could not detect payment protocol`, {
+        event: 'protocol_detection_failed', url: urlString,
+      });
       return probeResponse;
     }
 
@@ -192,7 +231,9 @@ export class PayMuxClient {
     );
 
     if (!requirement) {
-      this.log(`[paymux] [err] No supported payment method found`);
+      this.logger.error(`[paymux] [err] No supported payment method found`, {
+        event: 'no_supported_method', url: urlString,
+      });
       return probeResponse;
     }
 
@@ -209,15 +250,18 @@ export class PayMuxClient {
     const amountUsd = requirement.amountUsd ?? parseFloat(requirement.amount);
     const amountRaw = requirement.amount;
 
-    this.log(
-      `[paymux]   Protocol: ${requirement.protocol} | Amount: $${amountUsd.toFixed(6)} (raw: ${amountRaw} ${requirement.currency})`
+    const currencyDisplay = getTokenName(requirement.currency);
+    this.logger.debug(
+      `[paymux]   Protocol: ${requirement.protocol} | Amount: $${amountUsd.toFixed(6)} (raw: ${amountRaw} ${currencyDisplay})`,
+      { event: 'payment_detected', protocol: requirement.protocol, amountUsd, amountRaw, currency: requirement.currency, url: urlString }
     );
 
     // Logic check: verify the base-unit-to-USD conversion is consistent
     if (requirement.protocol === 'x402' && requirement.amountUsd !== undefined) {
       if (!verifyAmountConsistency(amountRaw, amountUsd, requirement.asset)) {
-        this.log(
-          `[paymux] [warn] Amount conversion may be inconsistent: raw=${amountRaw}, usd=${amountUsd}, asset=${requirement.asset}`
+        this.logger.warn(
+          `[paymux] [warn] Amount conversion may be inconsistent: raw=${amountRaw}, usd=${amountUsd}, asset=${requirement.asset}`,
+          { event: 'amount_inconsistency', amountRaw, amountUsd, asset: requirement.asset, url: urlString }
         );
       }
     }
@@ -256,8 +300,9 @@ export class PayMuxClient {
       this.paymentHistory = this.paymentHistory.slice(-PayMuxClient.MAX_HISTORY);
     }
 
-    this.log(
-      `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
+    this.logger.info(
+      `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`,
+      { event: 'payment_success', protocol: result.protocol, amountUsd, transactionHash: result.transactionHash, url: urlString }
     );
 
     return response;
@@ -351,6 +396,84 @@ export class PayMuxClient {
     this.spendingEnforcer.updateLimits(limits);
   }
 
+
+  // ── Session management ─────────────────────────────────────────────
+
+  /**
+   * Open an MPP session for amortized payments to a single origin.
+   *
+   * Sessions use mppx's payment channels: the first request opens an on-chain
+   * channel with a deposit (the session budget), and subsequent requests send
+   * off-chain vouchers — no new on-chain transaction per request.
+   *
+   * The session budget is charged against global spending limits upfront when
+   * the session is opened. When the session is closed, unspent budget is
+   * released back to the global limits.
+   *
+   * @example
+   * ```typescript
+   * const session = await agent.openSession({
+   *   url: 'https://api.example.com',
+   *   budget: 5.00,        // Max $5 for this session
+   *   duration: 3600000,   // 1 hour
+   * });
+   *
+   * // Each fetch reuses the payment channel — 1 HTTP call, no on-chain tx
+   * const res1 = await session.fetch('/api/data?q=foo');
+   * const res2 = await session.fetch('/api/data?q=bar');
+   *
+   * // Close to reclaim unspent deposit
+   * await session.close();
+   * ```
+   *
+   * @throws {SpendingLimitError} If the session budget exceeds global spending limits
+   * @throws {Error} If no wallet is configured
+   */
+  async openSession(config: SessionConfig): Promise<PayMuxSession> {
+    if (!this.config.wallet?.privateKey) {
+      throw new Error(
+        'PayMux: openSession() requires a wallet. Pass wallet.privateKey to PayMux.create().'
+      );
+    }
+
+    // Charge the full session budget against global spending limits upfront.
+    // This ensures the agent can't circumvent daily limits by opening many sessions.
+    // When the session closes, unspent budget is released back.
+    this.spendingEnforcer.check(config.budget);
+
+    const session = new PayMuxSession(
+      this.config.wallet,
+      { ...config, debug: config.debug ?? this.config.debug },
+      this.spendingEnforcer
+    );
+
+    try {
+      await session.initialize();
+    } catch (error) {
+      // Release the reserved budget if initialization fails
+      this.spendingEnforcer.release(config.budget);
+      throw error;
+    }
+
+    this.activeSessions.push(session);
+
+    this.logger.info(
+      `[paymux] [session] Opened session for ${config.url} — budget: $${config.budget.toFixed(2)}`,
+      { event: 'session_opened', url: config.url, budget: config.budget, duration: config.duration }
+    );
+
+    return session;
+  }
+
+  /**
+   * Get all active (not closed or expired) sessions.
+   */
+  get sessions(): readonly PayMuxSession[] {
+    // Clean up closed/expired sessions
+    this.activeSessions = this.activeSessions.filter(s => s.isOpen);
+    return [...this.activeSessions];
+  }
+
   // ── Protocol cache methods ──────────────────────────────────────────
 
   /**
@@ -389,7 +512,9 @@ export class PayMuxClient {
 
     // If probe returned non-402, endpoint no longer requires payment
     if (!probeResult) {
-      this.log(`[paymux] [<] MPP fast path — endpoint no longer requires payment`);
+      this.logger.debug(`[paymux] [<] MPP fast path — endpoint no longer requires payment`, {
+        event: 'mpp_no_longer_paid', url,
+      });
       // Evict stale cache entry
       this.protocolCache.delete(this.getCacheKey(url));
       // Re-fetch to return the actual non-402 response to the caller.
@@ -399,8 +524,10 @@ export class PayMuxClient {
 
     const amountUsd = probeResult.amountUsd;
 
-    this.log(
-      `[paymux] [probe] MPP fast path: $${amountUsd.toFixed(6)} (raw: ${probeResult.amountRaw} ${probeResult.currency})`
+    const currencyDisplay = getTokenName(probeResult.currency);
+    this.logger.debug(
+      `[paymux] [probe] MPP fast path: $${amountUsd.toFixed(6)} (raw: ${probeResult.amountRaw} ${currencyDisplay})`,
+      { event: 'mpp_probe', amountUsd, amountRaw: probeResult.amountRaw, currency: probeResult.currency, url }
     );
 
     // Step 2: ENFORCE SPENDING LIMITS — all checks BEFORE payment
@@ -433,7 +560,9 @@ export class PayMuxClient {
     // release the pending amount since no payment was made
     if (!result.receipt) {
       this.spendingEnforcer.release(amountUsd);
-      this.log(`[paymux] [<] ${response.status} (MPP fast path — no payment on retry)`);
+      this.logger.debug(`[paymux] [<] ${response.status} (MPP fast path — no payment on retry)`, {
+        event: 'mpp_no_payment_retry', status: response.status, url,
+      });
       this.protocolCache.delete(this.getCacheKey(url));
       return response;
     }
@@ -446,8 +575,9 @@ export class PayMuxClient {
       this.paymentHistory = this.paymentHistory.slice(-PayMuxClient.MAX_HISTORY);
     }
 
-    this.log(
-      `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via mpp (fast path)${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
+    this.logger.info(
+      `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via mpp (fast path)${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`,
+      { event: 'payment_success', protocol: 'mpp', amountUsd, transactionHash: result.transactionHash, fastPath: true, url }
     );
 
     return response;
@@ -525,9 +655,81 @@ export class PayMuxClient {
     this.protocolCache.clear();
   }
 
-  private log(message: string): void {
-    if (this.config.debug) {
-      console.log(message);
+  // ── Retry helpers ───────────────────────────────────────────────
+
+  /**
+   * Probe with retry — wraps the initial probe fetch with retry logic
+   * for transient network failures.
+   *
+   * CRITICAL: Only retries safe HTTP methods (GET/HEAD by default).
+   * POST/PUT/DELETE are never retried by default to prevent double-charges.
+   * This ONLY wraps the initial probe — never retries after a payment.
+   *
+   * Retries on:
+   * - Network errors (TypeError from fetch — DNS failure, connection refused, etc.)
+   * - HTTP responses with status in retryableStatusCodes (default: 502, 503, 504)
+   *
+   * Uses exponential backoff: baseDelay * 2^attempt (1s, 2s, 4s...)
+   */
+  private async probeWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const rc = this.retryConfig;
+    const method = (init.method ?? 'GET').toUpperCase();
+
+    // No retry config, or method not retryable — single attempt
+    if (!rc || !rc.retryMethods.includes(method)) {
+      return globalThis.fetch(url, init);
     }
+
+    const totalAttempts = 1 + rc.maxRetries; // 1 initial + N retries
+    let lastError: unknown;
+    let lastResponse: Response | undefined;
+
+    for (let attempt = 0; attempt < totalAttempts; attempt++) {
+      try {
+        const response = await globalThis.fetch(url, init);
+
+        // If response status is not retryable, return immediately
+        if (!rc.retryableStatusCodes.includes(response.status)) {
+          return response;
+        }
+
+        // Retryable status code — save response and maybe retry
+        lastResponse = response;
+
+        if (attempt < totalAttempts - 1) {
+          const delayMs = rc.baseDelayMs * Math.pow(2, attempt);
+          this.logger.debug(
+            `[paymux] Retry ${attempt + 1}/${rc.maxRetries} after ${delayMs}ms (${response.status} ${response.statusText})`,
+            { event: 'retry', attempt: attempt + 1, maxRetries: rc.maxRetries, delayMs, status: response.status, url }
+          );
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      } catch (error) {
+        // Network errors (TypeError from fetch: DNS failure, connection refused, etc.)
+        lastError = error;
+
+        if (attempt < totalAttempts - 1) {
+          const delayMs = rc.baseDelayMs * Math.pow(2, attempt);
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          this.logger.debug(
+            `[paymux] Retry ${attempt + 1}/${rc.maxRetries} after ${delayMs}ms (${errorMessage})`,
+            { event: 'retry', attempt: attempt + 1, maxRetries: rc.maxRetries, delayMs, error: errorMessage, url }
+          );
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
+      }
+    }
+
+    // All retries exhausted — throw with context
+    if (lastResponse) {
+      throw new Error(
+        `PayMux: Request failed after ${totalAttempts} attempts (1 initial + ${rc.maxRetries} retries). Last error: ${lastResponse.status} ${lastResponse.statusText}`
+      );
+    }
+
+    const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    throw new Error(
+      `PayMux: Request failed after ${totalAttempts} attempts (1 initial + ${rc.maxRetries} retries). Last error: ${errorMessage}`
+    );
   }
 }

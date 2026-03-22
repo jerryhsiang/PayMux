@@ -115,6 +115,12 @@ Then install peer dependencies for the protocols you need:
 | **MPP** (Stripe/Tempo) | `mppx` `viem` | `npm install mppx viem` |
 | **Both protocols** | All of the above | `npm install @x402/core @x402/evm mppx viem` |
 
+> **Note:** `mppx` requires Express 5+. If you're on Express 4, install with `--legacy-peer-deps`:
+> ```bash
+> npm install mppx viem --legacy-peer-deps
+> ```
+> PayMux's server middleware works with both Express 4 and 5.
+
 For server middleware, also install your framework:
 
 ```bash
@@ -255,6 +261,8 @@ mpp: {
 
 [Tempo](https://tempo.xyz) is a sub-second finality blockchain (EVM-compatible) purpose-built for payments by the team behind MPP. Settlement costs <$0.001. Payments settle in **PathUSD**, a USD-pegged stablecoin native to Tempo.
 
+**PathUSD** uses 6 decimal places (like USDC), with token address `0x20c0000000000000000000000000000000000000` on Tempo. PayMux handles the conversion automatically -- developers always specify amounts in human-readable USD (e.g., `0.01` = one cent). The underlying base-unit conversion (e.g., `0.01` becomes `10000` in 6-decimal base units) is internal to PayMux and the MPP protocol.
+
 `tempoRecipient` is a standard Ethereum/EVM wallet address where PathUSD payments land. Any EVM address works -- you do not need a special Tempo account.
 
 For testnet development, create an auto-funded account:
@@ -268,6 +276,10 @@ mppx account create   # Generates a wallet and funds it on Tempo testnet
 
 When provided, the server accepts both Tempo (crypto) and Stripe (card) payment methods through MPP. Agents that prefer card payments can pay via Stripe, while crypto-native agents pay via Tempo.
 
+Under the hood, PayMux uses **Stripe Payment Intents** with `card` and `link` payment methods. Stripe handles all PCI compliance for card data — no sensitive card information touches your server.
+
+The `stripeSecretKey` must be a Stripe secret key (`sk_test_...` for testing or `sk_live_...` for production). You can find it in the [Stripe Dashboard](https://dashboard.stripe.com/apikeys) under Developers > API keys.
+
 ```typescript
 mpp: {
   secretKey: process.env.MPP_SECRET_KEY!,
@@ -275,6 +287,12 @@ mpp: {
   stripeSecretKey: process.env.STRIPE_SECRET_KEY, // Optional: enables card payments via MPP
 }
 ```
+
+**Reconciliation:** MPP receipts include a `reference` field. For Stripe-settled payments, this maps to the Stripe Payment Intent ID (e.g., `pi_3abc...`), which you can look up in the Stripe Dashboard or API.
+
+**Refunds:** Not currently supported through PayMux. Use the [Stripe Dashboard](https://dashboard.stripe.com/payments) or Stripe API directly to issue refunds on Payment Intents.
+
+**Webhooks:** Not yet supported. To track payment status changes (disputes, refunds, failures), configure [Stripe webhooks](https://docs.stripe.com/webhooks) directly for now.
 
 ---
 

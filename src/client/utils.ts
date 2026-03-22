@@ -14,6 +14,19 @@ const TOKEN_DECIMALS: Record<string, number> = {
   '0x41e94eb71ef8c9863e91b9c684d4e1b9f5b1eea5': 6, // Polygon Amoy
   '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 6, // Ethereum mainnet
   '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238': 6, // Ethereum Sepolia
+  // PathUSD on Tempo chain — 6 decimals (used by MPP/mppx)
+  '0x20c0000000000000000000000000000000000000': 6,
+};
+
+/** Human-readable token names by address (lowercase) for debug output */
+const TOKEN_NAMES: Record<string, string> = {
+  '0x20c0000000000000000000000000000000000000': 'PathUSD',
+  '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913': 'USDC (Base)',
+  '0x036cbd53842c5426634e7929541ec2318f3dcf7e': 'USDC (Base Sepolia)',
+  '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359': 'USDC (Polygon)',
+  '0x41e94eb71ef8c9863e91b9c684d4e1b9f5b1eea5': 'USDC (Polygon Amoy)',
+  '0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48': 'USDC (Ethereum)',
+  '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238': 'USDC (Ethereum Sepolia)',
 };
 
 /** Default decimals when token is unknown (USDC = 6) */
@@ -52,6 +65,42 @@ function getDecimals(asset?: string): number {
 }
 
 /**
+ * Check whether a currency string is a hex token address (e.g., "0x20c0...").
+ *
+ * Real mppx servers use the token contract address as the currency field.
+ * Hand-crafted or demo challenges use fiat strings like "USD" or "EUR".
+ * This distinction determines whether the amount is in base units or human-readable.
+ */
+export function isTokenAddress(currency: string): boolean {
+  return /^0x[0-9a-fA-F]+$/.test(currency);
+}
+
+/**
+ * Convert an MPP amount to USD.
+ *
+ * When the currency is a hex token address (e.g., PathUSD "0x20c0..."), the
+ * amount is in base units and must be converted using token decimals.
+ * When the currency is a fiat string (e.g., "USD"), the amount is already
+ * human-readable and is parsed directly.
+ *
+ * This handles the critical mismatch between real mppx servers (base units)
+ * and hand-crafted demo challenges (human-readable amounts).
+ */
+export function mppAmountToUsd(amount: string, currency: string): number | undefined {
+  const parsed = parseFloat(amount);
+  if (!Number.isFinite(parsed)) return undefined;
+
+  if (isTokenAddress(currency)) {
+    // Currency is a token address — amount is in base units.
+    // Convert using token decimals (defaults to 6 for unknown tokens).
+    return fromBaseUnits(amount, currency);
+  }
+
+  // Currency is a fiat string (e.g., "USD", "EUR") — amount is human-readable.
+  return parsed;
+}
+
+/**
  * Safety check: verify that a USD amount matches expected base units.
  * Returns true if the conversion is consistent.
  *
@@ -70,4 +119,17 @@ export function verifyAmountConsistency(
   const original = parseInt(baseUnits, 10);
   // Allow 1 unit tolerance for floating-point rounding
   return Math.abs(reconverted - original) <= 1;
+}
+
+/**
+ * Get a human-readable token name for a currency string.
+ *
+ * If the currency is a known token address, returns the token name
+ * (e.g., "PathUSD", "USDC (Base Sepolia)"). If the currency is a
+ * fiat string like "USD", returns it as-is. For unknown token addresses,
+ * returns the hex address unchanged.
+ */
+export function getTokenName(currency: string): string {
+  if (!isTokenAddress(currency)) return currency;
+  return TOKEN_NAMES[currency.toLowerCase()] ?? currency;
 }

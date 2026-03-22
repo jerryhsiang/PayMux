@@ -23,6 +23,15 @@ export { PayMux } from './client/paymux.js';
 export type { PayMuxClient } from './client/paymux.js';
 export { SpendingLimitError } from './client/spending.js';
 
+// Sessions
+export { PayMuxSession } from './client/session.js';
+export type { SessionConfig } from './client/session.js';
+
+
+// Logger
+export type { PayMuxLogger } from './client/logger.js';
+export { DefaultLogger, NoopLogger } from './client/logger.js';
+
 // Types
 export type { PayMuxConfig, PayMuxFetchOptions } from './client/types.js';
 export type {

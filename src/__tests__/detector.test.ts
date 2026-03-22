@@ -100,8 +100,12 @@ describe('detectProtocol', () => {
       return btoa(json).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     }
 
-    it('detects MPP from WWW-Authenticate: Payment header', async () => {
-      const requestPayload = { amount: '0.10', currency: 'USD', recipient: '0xABC' };
+    // PathUSD token address used by real mppx servers
+    const PATHUSD = '0x20c0000000000000000000000000000000000000';
+
+    it('detects MPP with token address currency and converts base units to USD', async () => {
+      // Real mppx format: amount in base units, currency is token address
+      const requestPayload = { amount: '10000', currency: PATHUSD, recipient: '0xABC' };
       const response = mock402({
         'www-authenticate': `Payment id="abc123", realm="my-api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
       });
@@ -110,12 +114,15 @@ describe('detectProtocol', () => {
       expect(result).toHaveLength(1);
       expect(result[0].protocol).toBe('mpp');
       expect(result[0].challengeId).toBe('abc123');
-      expect(result[0].amount).toBe('0.10');
-      expect(result[0].amountUsd).toBe(0.10);
+      expect(result[0].amount).toBe('10000');
+      expect(result[0].currency).toBe(PATHUSD);
+      // 10000 base units / 10^6 decimals = $0.01
+      expect(result[0].amountUsd).toBe(0.01);
     });
 
-    it('extracts amount from base64url-encoded request param (CRITICAL: spending limits)', async () => {
-      const requestPayload = { amount: '100000', currency: 'USD' };
+    it('extracts amount from base64url-encoded request param with token address (CRITICAL: spending limits)', async () => {
+      // amount="100000" with PathUSD (6 decimals) = $0.10
+      const requestPayload = { amount: '100000', currency: PATHUSD };
       const response = mock402({
         'www-authenticate': `Payment id="xyz", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
       });
@@ -124,12 +131,41 @@ describe('detectProtocol', () => {
       expect(result).toHaveLength(1);
       expect(result[0].protocol).toBe('mpp');
       expect(result[0].amount).toBe('100000');
-      expect(result[0].amountUsd).toBe(100000);
+      // 100000 / 10^6 = $0.10
+      expect(result[0].amountUsd).toBe(0.1);
+      expect(result[0].currency).toBe(PATHUSD);
+    });
+
+    it('handles unknown token address with default 6 decimals', async () => {
+      const unknownToken = '0xdeadbeef00000000000000000000000000000000';
+      const requestPayload = { amount: '5000000', currency: unknownToken };
+      const response = mock402({
+        'www-authenticate': `Payment id="unk", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
+      });
+
+      const result = await detectProtocol(response);
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('5000000');
+      // 5000000 / 10^6 = $5.00 (unknown token defaults to 6 decimals)
+      expect(result[0].amountUsd).toBe(5.0);
+      expect(result[0].currency).toBe(unknownToken);
+    });
+
+    it('backward compat: treats fiat currency "USD" as human-readable amount', async () => {
+      // Hand-crafted demo format: amount is human-readable, currency is fiat string
+      const requestPayload = { amount: '0.05', currency: 'USD' };
+      const response = mock402({
+        'www-authenticate': `Payment id="demo", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
+      });
+
+      const result = await detectProtocol(response);
+      expect(result).toHaveLength(1);
+      expect(result[0].amount).toBe('0.05');
+      expect(result[0].amountUsd).toBe(0.05);
       expect(result[0].currency).toBe('USD');
     });
 
-    it('extracts amount and currency from request param with base64url padding', async () => {
-      // Use a payload that produces base64 requiring padding characters
+    it('backward compat: treats fiat currency "EUR" as human-readable amount', async () => {
       const requestPayload = { amount: '0.05', currency: 'EUR' };
       const response = mock402({
         'www-authenticate': `Payment id="pad-test", realm="api", method="tempo", intent="charge", request="${toBase64url(requestPayload)}"`,
@@ -180,15 +216,16 @@ describe('detectProtocol', () => {
 
     it('request param amount takes precedence over top-level amount', async () => {
       // If both are present, the decoded request data should win
-      const requestPayload = { amount: '99.99', currency: 'USD' };
+      const requestPayload = { amount: '50000', currency: PATHUSD };
       const response = mock402({
         'www-authenticate': `Payment amount="0.01", currency="EUR", request="${toBase64url(requestPayload)}"`,
       });
 
       const result = await detectProtocol(response);
-      expect(result[0].amount).toBe('99.99');
-      expect(result[0].amountUsd).toBe(99.99);
-      expect(result[0].currency).toBe('USD');
+      expect(result[0].amount).toBe('50000');
+      // 50000 / 10^6 = $0.05
+      expect(result[0].amountUsd).toBe(0.05);
+      expect(result[0].currency).toBe(PATHUSD);
     });
   });
 
