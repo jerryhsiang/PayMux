@@ -50,7 +50,7 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 |----------|---------|-------|--------|
 | **x402** | Coinbase + Cloudflare | Per-request HTTP 402 micropayments | **Supported** |
 | **MPP** | Stripe + Tempo + Paradigm | Session-based streaming payments | **Supported** |
-| **ACP** | OpenAI + Stripe | E-commerce checkout | Planned |
+| **Visa TAP** | Visa + 21 banks | Card-based agent payments via [Trusted Agent Protocol](https://github.com/visa/trusted-agent-protocol) | Planned |
 
 **For agent developers:** Integrate each protocol separately, detect which protocol a service accepts, handle signing and settlement independently.
 
@@ -256,11 +256,11 @@ All chains use USDC with correct contract addresses.
 │  │  MPP Client        │◄────────►│  MPP Verification      │  │
 │  │  Spending Enforcer │          │  Settlement Router     │  │
 │  │                    │          │                        │  │
-│  │  (Card: future)    │          │  Express / Hono /      │  │
+│  │  (Visa TAP: next)  │          │  Express / Hono /      │  │
 │  │                    │          │  CF Workers            │  │
 │  └────────────────────┘          └────────────────────────┘  │
 ├──────────────────────────────────────────────────────────────┤
-│  Protocols: x402 + MPP | Card (future)                       │
+│  Protocols: x402 + MPP | Visa TAP (next)                     │
 ├──────────────────────────────────────────────────────────────┤
 │  Rails: Base / Polygon / Ethereum (USDC) + Tempo (PathUSD)   │
 └──────────────────────────────────────────────────────────────┘
