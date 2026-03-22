@@ -16,6 +16,32 @@ export type Chain =
   | string;
 
 /**
+ * Receipt from an x402 payment — signed EIP-712 payment proof
+ */
+export interface X402Receipt {
+  success: boolean;
+  transaction?: string;
+  network?: string;
+  payer?: string;
+}
+
+/**
+ * Receipt from an MPP payment — session-based payment confirmation
+ */
+export interface MppReceipt {
+  status: 'success';
+  method: string;
+  reference: string;
+  timestamp: string;
+  externalId?: string;
+}
+
+/**
+ * Union of all protocol-specific receipt types
+ */
+export type PaymentReceipt = X402Receipt | MppReceipt;
+
+/**
  * Result of a completed payment
  */
 export interface PaymentResult {
@@ -30,7 +56,7 @@ export interface PaymentResult {
    * - mpp: `{ sessionId: string; invoice?: string }` — the MPP session receipt
    * - card: `{ chargeId: string; last4: string }` — the card charge confirmation (future)
    */
-  receipt?: unknown;
+  receipt?: PaymentReceipt;
   settledAt?: number;
 }
 
@@ -39,8 +65,16 @@ export interface PaymentResult {
  */
 export interface PaymentRequirement {
   protocol: Protocol;
+  /** Raw amount from the server (base units for x402, USD for MPP) */
   amount: string;
   currency: string;
+  /**
+   * Amount converted to USD for spending limit comparison.
+   * For x402: base units converted via token decimals (e.g., "10000" → 0.01 for USDC)
+   * For MPP: same as parseFloat(amount)
+   * This is what the SpendingEnforcer checks against perRequest/perDay limits.
+   */
+  amountUsd?: number;
   recipient?: string;
   chain?: Chain;
   resource?: string;

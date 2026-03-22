@@ -33,4 +33,7 @@ export type {
   WalletConfig,
   CardConfig,
   SpendingLimits,
+  X402Receipt,
+  MppReceipt,
+  PaymentReceipt,
 } from './shared/types.js';

@@ -1,4 +1,4 @@
-import type { PaymentRequirement, PaymentResult, WalletConfig } from '../../shared/types.js';
+import type { PaymentRequirement, PaymentResult, WalletConfig, MppReceipt } from '../../shared/types.js';
 
 /**
  * MPP payment client — wraps mppx for session-based streaming payments.
@@ -85,7 +85,7 @@ export class MppClient {
 
     // Parse Payment-Receipt header (base64url-encoded JSON)
     const receiptHeader = response.headers.get('payment-receipt');
-    let receipt: unknown = null;
+    let receipt: MppReceipt | undefined;
     let transactionHash: string | undefined;
 
     if (receiptHeader) {
@@ -93,10 +93,18 @@ export class MppClient {
         // Payment-Receipt is base64url-encoded JSON per the MPP spec
         // Fields: { status: "success", method, reference, timestamp, externalId? }
         const decoded = atob(receiptHeader.replace(/-/g, '+').replace(/_/g, '/'));
-        receipt = JSON.parse(decoded);
-        if (receipt && typeof receipt === 'object') {
+        const parsed: unknown = JSON.parse(decoded);
+        if (parsed && typeof parsed === 'object') {
+          const raw = parsed as Record<string, unknown>;
+          receipt = {
+            status: 'success',
+            method: raw.method as string,
+            reference: raw.reference as string,
+            timestamp: raw.timestamp as string,
+            externalId: raw.externalId as string | undefined,
+          };
           // MPP spec: 'reference' contains the tx hash or payment intent ID
-          transactionHash = (receipt as Record<string, unknown>).reference as string;
+          transactionHash = receipt.reference;
         }
       } catch {
         // Receipt parsing failed — non-critical, payment still succeeded

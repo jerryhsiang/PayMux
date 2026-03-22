@@ -15,7 +15,7 @@ export class SpendingEnforcer {
   private dailyResetAt: number;
 
   constructor(private limits: SpendingLimits) {
-    this.dailyResetAt = Date.now() + 24 * 60 * 60 * 1000;
+    this.dailyResetAt = new Date().setUTCHours(24, 0, 0, 0);
   }
 
   /**
@@ -85,6 +85,15 @@ export class SpendingEnforcer {
   }
 
   /**
+   * Update spending limits at runtime.
+   * Does NOT reset current spend — only changes future limit checks.
+   * Useful for external systems that manage agent budgets.
+   */
+  updateLimits(limits: SpendingLimits): void {
+    this.limits = limits;
+  }
+
+  /**
    * Get current spending stats
    */
   stats(): {
@@ -110,8 +119,7 @@ export class SpendingEnforcer {
   private resetDailyIfNeeded(): void {
     if (Date.now() > this.dailyResetAt) {
       this.dailySpend = 0;
-      this.pendingSpend = 0;
-      this.dailyResetAt = Date.now() + 24 * 60 * 60 * 1000;
+      this.dailyResetAt = new Date().setUTCHours(24, 0, 0, 0);
     }
   }
 }

@@ -17,6 +17,10 @@ export interface PayMuxServerConfig {
     facilitator?: string;
     /** Token contract address (default: USDC on selected chain) */
     asset?: string;
+    /** Timeout in ms for facilitator verify calls (default: 30000) */
+    verifyTimeoutMs?: number;
+    /** Timeout in ms for facilitator settle calls (default: 60000) */
+    settleTimeoutMs?: number;
   };
 
   /** MPP configuration (Stripe/Tempo) */

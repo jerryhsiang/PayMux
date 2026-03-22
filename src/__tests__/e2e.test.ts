@@ -242,10 +242,12 @@ describe('E2E: Agent protocol detection against real server', () => {
   it('spending limits checked BEFORE payment attempt', async () => {
     const agent = PayMux.create({
       wallet: { privateKey: '0x0000000000000000000000000000000000000000000000000000000000000001' },
-      limits: { perRequest: 1 }, // Very low — 50000 base units will exceed this
+      limits: { perRequest: 0.01 }, // $0.01 limit — server charges $0.05 (50000 base units = $0.05 USD)
     });
 
-    // Should throw SpendingLimitError BEFORE attempting payment
+    // With the unit conversion fix, 50000 base units = $0.05 USD
+    // perRequest is $0.01, so $0.05 > $0.01 → SpendingLimitError
+    // This must throw BEFORE attempting payment
     await expect(
       agent.fetch(`${serverUrl}/api/data`)
     ).rejects.toThrow(SpendingLimitError);

@@ -1,4 +1,4 @@
-import type { PaymentRequirement, PaymentResult, WalletConfig } from '../../shared/types.js';
+import type { PaymentRequirement, PaymentResult, WalletConfig, X402Receipt } from '../../shared/types.js';
 
 /**
  * x402 payment client — wraps @x402/fetch to handle the full 402 → pay → retry flow.
@@ -74,17 +74,22 @@ export class X402Client {
 
     // Extract payment receipt from response headers (x402 spec: success/transaction/network)
     const paymentResponseHeader = response.headers.get('payment-response');
-    let receipt: unknown = null;
+    let receipt: X402Receipt | undefined;
     let transaction: string | undefined;
 
     if (paymentResponseHeader) {
       try {
-        receipt = JSON.parse(atob(paymentResponseHeader));
-        if (receipt && typeof receipt === 'object') {
+        const parsed: unknown = JSON.parse(atob(paymentResponseHeader));
+        if (parsed && typeof parsed === 'object') {
+          const raw = parsed as Record<string, unknown>;
+          receipt = {
+            success: raw.success === true,
+            transaction: raw.transaction as string | undefined,
+            network: raw.network as string | undefined,
+            payer: raw.payer as string | undefined,
+          };
           // x402 spec uses 'transaction', but also handle 'transactionHash' for compat
-          transaction =
-            (receipt as Record<string, unknown>).transaction as string ??
-            (receipt as Record<string, unknown>).transactionHash as string;
+          transaction = receipt.transaction ?? (raw.transactionHash as string | undefined);
         }
       } catch {
         // Receipt parsing failed — non-critical

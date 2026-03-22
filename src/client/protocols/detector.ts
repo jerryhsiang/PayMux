@@ -1,4 +1,5 @@
 import type { PaymentRequirement, Protocol } from '../../shared/types.js';
+import { fromBaseUnits } from '../utils.js';
 
 /**
  * Header names used by payment protocols
@@ -113,22 +114,29 @@ function parseX402V2(
   }
 
   return accepts.map(
-    (accept: Record<string, unknown>): PaymentRequirement => ({
-      protocol: 'x402' as Protocol,
-      amount: String(accept.maxAmountRequired ?? accept.price ?? '0'),
-      currency: String(accept.asset ?? 'USDC'),
-      recipient: String(accept.payTo ?? ''),
-      chain: networkToChain(String(accept.network ?? '')),
-      network: String(accept.network ?? ''),
-      payTo: String(accept.payTo ?? ''),
-      scheme: String(accept.scheme ?? 'exact'),
-      maxAmountRequired: String(
-        accept.maxAmountRequired ?? accept.price ?? '0'
-      ),
-      asset: String(accept.asset ?? 'USDC'),
-      resource: String(parsed.resource ?? ''),
-      raw: accept,
-    })
+    (accept: Record<string, unknown>): PaymentRequirement => {
+      const baseAmount = String(accept.maxAmountRequired ?? accept.price ?? '0');
+      const asset = String(accept.asset ?? '');
+      return {
+        protocol: 'x402' as Protocol,
+        amount: baseAmount,
+        currency: asset || 'USDC',
+        // CRITICAL: Convert base units to USD for spending limit comparison.
+        // x402 sends amounts in token base units (e.g., "10000" = $0.01 for 6-decimal USDC).
+        // SpendingEnforcer limits are in USD. Without this conversion, a $0.01 payment
+        // would be compared as 10000 > 1.00 (perRequest), incorrectly blocking it.
+        amountUsd: fromBaseUnits(baseAmount, asset || undefined),
+        recipient: String(accept.payTo ?? ''),
+        chain: networkToChain(String(accept.network ?? '')),
+        network: String(accept.network ?? ''),
+        payTo: String(accept.payTo ?? ''),
+        scheme: String(accept.scheme ?? 'exact'),
+        maxAmountRequired: baseAmount,
+        asset,
+        resource: String(parsed.resource ?? ''),
+        raw: accept,
+      };
+    }
   );
 }
 
@@ -142,13 +150,14 @@ function parseX402V1(
     return null;
   }
 
+  const baseAmount = String(parsed.maxAmountRequired ?? parsed.price ?? parsed.amount ?? '0');
+  const asset = String(parsed.asset ?? '');
   return [
     {
       protocol: 'x402',
-      amount: String(
-        parsed.maxAmountRequired ?? parsed.price ?? parsed.amount ?? '0'
-      ),
-      currency: String(parsed.asset ?? 'USDC'),
+      amount: baseAmount,
+      currency: asset || 'USDC',
+      amountUsd: fromBaseUnits(baseAmount, asset || undefined),
       recipient: String(parsed.payTo ?? ''),
       chain: networkToChain(String(parsed.network ?? '')),
       network: String(parsed.network ?? ''),

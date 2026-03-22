@@ -1,4 +1,38 @@
 /**
+ * Retry a fetch call on transient (5xx) failures.
+ *
+ * - Only retries on HTTP 5xx status codes (server errors).
+ * - 4xx responses are real errors and are returned immediately.
+ * - Network/timeout errors (thrown exceptions) are NOT retried — they propagate.
+ * - Max 2 retries with a 1 second delay between attempts.
+ */
+export async function fetchWithRetry(
+  input: string | URL | Request,
+  init?: RequestInit,
+  maxRetries: number = 2,
+  delayMs: number = 1000
+): Promise<Response> {
+  let lastResponse: Response | undefined;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(input, init);
+
+    // 5xx → transient server error, eligible for retry
+    if (response.status >= 500 && response.status < 600 && attempt < maxRetries) {
+      lastResponse = response;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      continue;
+    }
+
+    // 2xx, 3xx, 4xx, or final 5xx attempt — return as-is
+    return response;
+  }
+
+  // Should not be reached, but satisfy TypeScript
+  return lastResponse!;
+}
+
+/**
  * USDC has 6 decimal places. Convert a human-readable USD amount
  * to the base unit string required by the x402 protocol.
  *

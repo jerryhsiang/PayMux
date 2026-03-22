@@ -1,9 +1,10 @@
 import type { PayMuxConfig, PayMuxFetchOptions } from './types.js';
-import type { PaymentRequirement, PaymentResult } from '../shared/types.js';
+import type { PaymentRequirement, PaymentResult, SpendingLimits } from '../shared/types.js';
 import { detectProtocol, selectBestRequirement } from './protocols/detector.js';
 import { X402Client } from './protocols/x402.js';
 import { MppClient } from './protocols/mpp.js';
 import { SpendingEnforcer } from './spending.js';
+import { verifyAmountConsistency } from './utils.js';
 
 /**
  * PayMux — Multi-protocol payment routing for AI agents.
@@ -118,21 +119,36 @@ export class PayMuxClient {
       return probeResponse;
     }
 
-    const amount = parseFloat(requirement.amount);
+    // CRITICAL: Use amountUsd (converted from base units) for spending checks.
+    // x402 sends amounts in base units (e.g., "10000" = $0.01 for 6-decimal USDC).
+    // Spending limits (perRequest, perDay, maxAmount) are all in USD.
+    // Without this conversion, a $0.01 payment would be checked as 10000 > 1.00.
+    const amountUsd = requirement.amountUsd ?? parseFloat(requirement.amount);
+    const amountRaw = requirement.amount;
+
     this.log(
-      `[paymux]   Protocol: ${requirement.protocol} | Amount: ${amount} ${requirement.currency}`
+      `[paymux]   Protocol: ${requirement.protocol} | Amount: $${amountUsd.toFixed(6)} (raw: ${amountRaw} ${requirement.currency})`
     );
 
-    // Step 4: ENFORCE SPENDING LIMITS — before any payment is made
-    // maxAmount ceiling check
-    if (maxAmount !== undefined && amount > maxAmount) {
+    // Logic check: verify the base-unit-to-USD conversion is consistent
+    if (requirement.protocol === 'x402' && requirement.amountUsd !== undefined) {
+      if (!verifyAmountConsistency(amountRaw, amountUsd, requirement.asset)) {
+        this.log(
+          `[paymux] [warn] Amount conversion may be inconsistent: raw=${amountRaw}, usd=${amountUsd}, asset=${requirement.asset}`
+        );
+      }
+    }
+
+    // Step 4: ENFORCE SPENDING LIMITS — all checks in USD
+    // maxAmount ceiling check (USD)
+    if (maxAmount !== undefined && amountUsd > maxAmount) {
       throw new Error(
-        `PayMux: Payment of $${amount.toFixed(2)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
+        `PayMux: Payment of $${amountUsd.toFixed(6)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
       );
     }
 
-    // Per-request + per-day limits (reserves amount as pending)
-    this.spendingEnforcer.check(amount);
+    // Per-request + per-day limits in USD (reserves amount as pending)
+    this.spendingEnforcer.check(amountUsd);
 
     // Step 5: Route to protocol client — release pending on failure
     let response: Response;
@@ -145,12 +161,12 @@ export class PayMuxClient {
     } catch (error) {
       // Release the pending reservation so failed payments don't
       // permanently reduce daily spending capacity
-      this.spendingEnforcer.release(amount);
+      this.spendingEnforcer.release(amountUsd);
       throw error;
     }
 
     // Step 6: Record successful payment (moves from pending to confirmed)
-    this.spendingEnforcer.record(amount);
+    this.spendingEnforcer.record(amountUsd);
     this.paymentHistory.push(result);
 
     if (this.paymentHistory.length > PayMuxClient.MAX_HISTORY) {
@@ -158,7 +174,7 @@ export class PayMuxClient {
     }
 
     this.log(
-      `[paymux] [ok] Paid ${requirement.amount} ${requirement.currency} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
+      `[paymux] [ok] Paid $${amountUsd.toFixed(6)} via ${result.protocol}${result.transactionHash ? ` | tx: ${result.transactionHash}` : ''}`
     );
 
     return response;
@@ -209,6 +225,9 @@ export class PayMuxClient {
     }
   }
 
+  /**
+   * Get current spending statistics (all values in USD).
+   */
   get spending() {
     const stats = this.spendingEnforcer.stats();
     return {
@@ -216,6 +235,33 @@ export class PayMuxClient {
       history: [...this.paymentHistory],
       totalSpent: stats.totalSpent,
     };
+  }
+
+  /**
+   * Get current spending limits.
+   */
+  get limits(): Readonly<SpendingLimits> {
+    return { ...this.config.limits } as SpendingLimits;
+  }
+
+  /**
+   * Update spending limits at runtime.
+   * Useful for systems that manage limits externally (e.g., a dashboard,
+   * an admin API, or a parent agent that controls child agent budgets).
+   *
+   * @example
+   * ```typescript
+   * // Reduce daily limit after detecting unusual activity
+   * agent.setLimits({ perRequest: 0.10, perDay: 5.00 });
+   *
+   * // Read current limits from an external system
+   * const limits = await fetchLimitsFromDashboard(agentId);
+   * agent.setLimits(limits);
+   * ```
+   */
+  setLimits(limits: SpendingLimits): void {
+    this.config = { ...this.config, limits };
+    this.spendingEnforcer.updateLimits(limits);
   }
 
   private log(message: string): void {

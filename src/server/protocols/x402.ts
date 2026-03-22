@@ -1,6 +1,6 @@
 import type { PayMuxServerConfig } from '../types.js';
 import type { ChargeOptions } from '../../shared/types.js';
-import { toBaseUnits } from '../utils.js';
+import { toBaseUnits, fetchWithRetry } from '../utils.js';
 
 /**
  * USDC contract addresses by chain (CAIP-2 network ID → address).
@@ -73,6 +73,8 @@ export async function verifyX402Payment(
     return { valid: false, error: 'No PAYMENT-SIGNATURE header found' };
   }
 
+  const verifyTimeoutMs = config.x402?.verifyTimeoutMs ?? 30000;
+
   try {
     const payload = JSON.parse(atob(paymentHeader));
     const facilitatorUrl = config.x402?.facilitator ?? DEFAULT_FACILITATOR;
@@ -80,10 +82,10 @@ export async function verifyX402Payment(
     const asset = config.x402?.asset ?? USDC_ADDRESSES[network] ?? USDC_ADDRESSES['eip155:8453'];
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
+    const timeout = setTimeout(() => controller.abort(), verifyTimeoutMs);
 
     try {
-      const verifyResponse = await fetch(`${facilitatorUrl}/verify`, {
+      const verifyResponse = await fetchWithRetry(`${facilitatorUrl}/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -123,7 +125,7 @@ export async function verifyX402Payment(
   } catch (error) {
     // Handle both DOMException (browser) and Error with name 'AbortError' (Node.js)
     if (error instanceof Error && error.name === 'AbortError') {
-      return { valid: false, error: 'Facilitator verification timed out (30s)' };
+      return { valid: false, error: `Facilitator verification timed out (${verifyTimeoutMs}ms)` };
     }
     return {
       valid: false,
@@ -146,6 +148,8 @@ export async function settleX402Payment(
     return { settled: false, error: 'No PAYMENT-SIGNATURE header found' };
   }
 
+  const settleTimeoutMs = config.x402?.settleTimeoutMs ?? 60000;
+
   try {
     const payload = JSON.parse(atob(paymentHeader));
     const facilitatorUrl = config.x402?.facilitator ?? DEFAULT_FACILITATOR;
@@ -153,12 +157,20 @@ export async function settleX402Payment(
     const asset = config.x402?.asset ?? USDC_ADDRESSES[network] ?? USDC_ADDRESSES['eip155:8453'];
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
+    const timeout = setTimeout(() => controller.abort(), settleTimeoutMs);
+
+    // Generate an idempotency key from the payment signature hash.
+    // This prevents double-settlement if the request is retried after a timeout.
+    // Best-effort: the facilitator may or may not honor this header.
+    const idempotencyKey = await generateIdempotencyKey(paymentHeader);
 
     try {
-      const settleResponse = await fetch(`${facilitatorUrl}/settle`, {
+      const settleResponse = await fetchWithRetry(`${facilitatorUrl}/settle`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'Idempotency-Key': idempotencyKey,
+        },
         signal: controller.signal,
         body: JSON.stringify({
           x402Version: 2,
@@ -197,7 +209,7 @@ export async function settleX402Payment(
     }
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      return { settled: false, error: 'Settlement timed out (60s)' };
+      return { settled: false, error: `Settlement timed out (${settleTimeoutMs}ms)` };
     }
     return {
       settled: false,
@@ -219,4 +231,24 @@ function chainToNetwork(chain: string): string {
     'ethereum-sepolia': 'eip155:11155111',
   };
   return networkMap[chain] ?? chain;
+}
+
+/**
+ * Generate a deterministic idempotency key from the payment signature.
+ *
+ * Uses SHA-256 of the raw PAYMENT-SIGNATURE header value, prefixed with "settle-".
+ * The same payment signature always produces the same key, so retried settlement
+ * requests carry the same Idempotency-Key header — preventing double-settlement
+ * if the facilitator honors the header.
+ *
+ * Uses the Web Crypto API (available in Node 15+, Cloudflare Workers, Deno, browsers).
+ */
+async function generateIdempotencyKey(paymentSignature: string): Promise<string> {
+  const data = new TextEncoder().encode(paymentSignature);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = new Uint8Array(hashBuffer);
+  const hashHex = Array.from(hashArray)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return `settle-${hashHex}`;
 }
