@@ -2,6 +2,66 @@ import type { PayMuxServerConfig, ChargeOptions, PayMuxMiddleware } from './type
 import { createExpressCharge } from './middleware/express.js';
 import { createHonoCharge } from './middleware/hono.js';
 
+/** Common placeholder patterns that should be rejected */
+const ETH_ADDRESS_PLACEHOLDERS = new Set([
+  '0x0000000000000000000000000000000000000000', // zero address
+]);
+
+const ETH_ADDRESS_PLACEHOLDER_PATTERNS = [
+  /your/i,   // 0xYourWalletAddress, 0xYOUR_ADDRESS, etc.
+  /example/i, // 0xExampleAddress
+  /replace/i, // 0xReplaceMe
+  /insert/i,  // 0xInsertHere
+  /todo/i,    // 0xTODO
+  /placeholder/i,
+  /^0x\.{3,}$/,  // 0x...
+  /^0xx+$/i,     // 0xxxxx
+];
+
+/**
+ * Validate that a string is a valid Ethereum address and not a placeholder.
+ * Returns an error message if invalid, or null if valid.
+ */
+function validateEthAddress(address: string, fieldName: string): string | null {
+  // Must start with 0x and be exactly 42 characters
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    return (
+      `PayMux Server: ${fieldName} is not a valid Ethereum address. ` +
+      `Got: "${address}". ` +
+      `Expected format: 0x followed by 40 hex characters (e.g., 0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18)`
+    );
+  }
+
+  // Check known placeholder addresses
+  if (ETH_ADDRESS_PLACEHOLDERS.has(address.toLowerCase())) {
+    return (
+      `PayMux Server: ${fieldName} is a placeholder address (zero address). ` +
+      `Got: "${address}". ` +
+      `Provide a real wallet address to receive payments.`
+    );
+  }
+
+  return null;
+}
+
+/**
+ * Validate that an address string is not a placeholder pattern (catches non-hex placeholders).
+ * Called before hex validation to give a better error message.
+ * Returns an error message if it matches a placeholder, or null otherwise.
+ */
+function checkPlaceholderPattern(address: string, fieldName: string): string | null {
+  for (const pattern of ETH_ADDRESS_PLACEHOLDER_PATTERNS) {
+    if (pattern.test(address)) {
+      return (
+        `PayMux Server: ${fieldName} is not a valid Ethereum address. ` +
+        `Got: "${address}". ` +
+        `Expected format: 0x followed by 40 hex characters (e.g., 0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18)`
+      );
+    }
+  }
+  return null;
+}
+
 /**
  * PayMuxServer — Accept payments from any AI agent, any protocol.
  *
@@ -59,6 +119,23 @@ export class PayMuxServer {
             'Generate one with: crypto.randomBytes(32).toString("base64")'
         );
       }
+    }
+
+    // Validate Ethereum addresses are real, not placeholders
+    if (config.x402?.recipient) {
+      const placeholderErr = checkPlaceholderPattern(config.x402.recipient, 'x402.recipient');
+      if (placeholderErr) throw new Error(placeholderErr);
+
+      const addrErr = validateEthAddress(config.x402.recipient, 'x402.recipient');
+      if (addrErr) throw new Error(addrErr);
+    }
+
+    if (config.mpp?.tempoRecipient) {
+      const placeholderErr = checkPlaceholderPattern(config.mpp.tempoRecipient, 'mpp.tempoRecipient');
+      if (placeholderErr) throw new Error(placeholderErr);
+
+      const addrErr = validateEthAddress(config.mpp.tempoRecipient, 'mpp.tempoRecipient');
+      if (addrErr) throw new Error(addrErr);
     }
 
     // Issue #9: Validate facilitator URL enforces HTTPS
@@ -119,7 +196,7 @@ export class PayMuxServerInstance {
     // enforce limits before payment verification to reduce facilitator load.
 
     // Return a function that detects the framework by argument count
-    return function paymuxCharge(...args: unknown[]): unknown {
+    return function paymuxCharge(...args: any[]): void | Promise<void> {
       if (args.length >= 3) {
         // Express: (req, res, next)
         return (expressMiddleware as Function).apply(null, args);

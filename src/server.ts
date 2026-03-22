@@ -28,6 +28,9 @@ export { PayMuxServer, PayMuxServerInstance } from './server/paymux-server.js';
 export type {
   PayMuxServerConfig,
   ChargeOptions,
+  PayMuxMiddleware,
+  ExpressPayMuxMiddleware,
+  HonoPayMuxMiddleware,
 } from './server/types.js';
 export type {
   Protocol,

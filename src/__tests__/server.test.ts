@@ -26,8 +26,51 @@ describe('PayMuxServer', () => {
     it('rejects non-HTTPS facilitator URL', () => {
       expect(() => PayMuxServer.create({
         accept: ['x402'],
-        x402: { recipient: '0x01', facilitator: 'http://evil.com' },
+        x402: { recipient: '0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18', facilitator: 'http://evil.com' },
       })).toThrow('must use HTTPS');
+    });
+
+    it('rejects x402.recipient that is too short', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0xDEAD' as `0x${string}` },
+      })).toThrow('not a valid Ethereum address');
+    });
+
+    it('rejects x402.recipient that is a placeholder like 0xYourWalletAddress', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0xYourWalletAddress' as `0x${string}` },
+      })).toThrow('not a valid Ethereum address');
+    });
+
+    it('rejects x402.recipient that is the zero address', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0x0000000000000000000000000000000000000000' },
+      })).toThrow('placeholder address (zero address)');
+    });
+
+    it('rejects mpp.tempoRecipient that is a placeholder', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['mpp'],
+        mpp: { secretKey: 'test-key', tempoRecipient: '0xYourWalletAddress' as `0x${string}` },
+      })).toThrow('not a valid Ethereum address');
+    });
+
+    it('rejects mpp.tempoRecipient that is too short', () => {
+      expect(() => PayMuxServer.create({
+        accept: ['mpp'],
+        mpp: { secretKey: 'test-key', tempoRecipient: '0xABC' as `0x${string}` },
+      })).toThrow('not a valid Ethereum address');
+    });
+
+    it('accepts a valid Ethereum address for x402.recipient', () => {
+      const payments = PayMuxServer.create({
+        accept: ['x402'],
+        x402: { recipient: '0x742d35Cc6634C0532925a3b844Bc9e7595f2bD18' },
+      });
+      expect(payments.protocols).toEqual(['x402']);
     });
 
     it('creates instance with valid x402 config', () => {

@@ -46,7 +46,7 @@ const agent = PayMux.create({
 });
 
 async function main() {
-  const SERVER = 'http://localhost:3000';
+  const SERVER = `http://localhost:${process.env.PORT || 3001}`;
 
   console.log('');
   console.log('🤖 PayMux Agent starting...');

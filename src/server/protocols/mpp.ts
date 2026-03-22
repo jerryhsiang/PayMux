@@ -13,19 +13,28 @@ import type { ChargeOptions } from '../../shared/types.js';
  * We create the mppx server instance lazily and cache it per-config.
  */
 
-interface MppxServerInstance {
-  charge: (opts: { amount: string; description?: string }) =>
-    (request: Request) => Promise<MppxChargeResult>;
-}
+/**
+ * A charge handler: call with options to get a request handler, then call
+ * with the Request to get the MPP result.
+ *
+ * Derived from mppx's `Mppx.compose()` return type — a function from
+ * `Request` to `Promise<{ status: 402; challenge: Response } | { status: 200; withReceipt: (r: Response) => Response }>`.
+ */
+type MppChargeHandler = (request: Request) => Promise<MppChargeResult>;
 
-interface MppxChargeResult {
-  status: 402 | 200;
-  challenge?: Response;
-  withReceipt?: <T>(response: T) => T;
-}
+type MppChargeResult =
+  | { status: 402; challenge: Response }
+  | { status: 200; withReceipt: (response: Response) => Response };
 
-/** Per-config instance cache. Keyed by hashed config values, not raw secrets. */
-const instanceCache = new Map<string, MppxServerInstance>();
+/**
+ * Cached charge factory: takes amount/description, returns an MppChargeHandler.
+ * Built from the mppx instance at creation time so we don't need to store
+ * (or type) the polymorphic mppx instance itself.
+ */
+type ChargeFactory = (opts: { amount: string; description?: string }) => MppChargeHandler;
+
+/** Per-config factory cache. Keyed by hashed config values, not raw secrets. */
+const factoryCache = new Map<string, ChargeFactory>();
 
 const MIN_SECRET_KEY_LENGTH = 32;
 
@@ -50,11 +59,16 @@ function hashConfigKey(secretKey: string, recipient: string, testnet: string): s
 }
 
 /**
- * Get or create the mppx server instance.
+ * Get or create an MPP charge factory.
  * Cached per unique config so multiple PayMuxServer instances with different
  * merchant configs can coexist without overwriting each other.
+ *
+ * Instead of caching the raw mppx instance (whose type is heavily generic and
+ * would require an unsafe double-cast), we build a ChargeFactory that uses
+ * `Mppx.compose()` — a standalone function with a concrete, exported signature.
+ * This gives us proper types without any `as unknown as` casts.
  */
-async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInstance> {
+async function getMppChargeFactory(config: PayMuxServerConfig): Promise<ChargeFactory> {
   if (!config.mpp) {
     throw new Error(
       'PayMux Server: MPP config is required. Pass mpp: { secretKey: "...", tempoRecipient: "0x..." }'
@@ -75,7 +89,7 @@ async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInst
     String(config.mpp.testnet ?? false),
   );
 
-  const cached = instanceCache.get(configKey);
+  const cached = factoryCache.get(configKey);
   if (cached) {
     return cached;
   }
@@ -124,9 +138,35 @@ async function getMppxServer(config: PayMuxServerConfig): Promise<MppxServerInst
     realm: config.mpp.realm ?? 'paymux',
   });
 
-  const instance = mppx as unknown as MppxServerInstance;
-  instanceCache.set(configKey, instance);
-  return instance;
+  // Build a charge factory using Mppx.compose(), which has a concrete exported
+  // type signature: (...handlers) => (Request) => Promise<Response>.
+  // This avoids the `as unknown as` double-cast on the polymorphic mppx instance.
+  //
+  // mppx.charge(...) is a shorthand intent accessor that returns a typed handler
+  // function `(Request) => Promise<Response>`. We access it via bracket notation
+  // since the 'charge' key is dynamically generated from the method intents.
+  // The compose() wrapper merges multiple method challenges into a single 402.
+  const chargeAccessor = (mppx as Record<string, unknown>)['charge'];
+  if (typeof chargeAccessor !== 'function') {
+    throw new Error(
+      'PayMux Server: mppx instance does not expose a .charge() handler. ' +
+        'This indicates a breaking change in the mppx package.'
+    );
+  }
+
+  const factory: ChargeFactory = (opts) => {
+    const handler = chargeAccessor(opts);
+    if (typeof handler !== 'function') {
+      throw new Error(
+        'PayMux Server: mppx .charge() did not return a request handler function. ' +
+          'This indicates a breaking change in the mppx package.'
+      );
+    }
+    return (request: Request) => handler(request) as Promise<MppChargeResult>;
+  };
+
+  factoryCache.set(configKey, factory);
+  return factory;
 }
 
 /**
@@ -144,13 +184,13 @@ export async function handleMppRequest(
   handled: boolean;
   status?: 402 | 200;
   challengeResponse?: Response;
-  withReceipt?: <T>(response: T) => T;
+  withReceipt?: (response: Response) => Response;
   error?: string;
 }> {
   try {
-    const mppx = await getMppxServer(config);
+    const charge = await getMppChargeFactory(config);
 
-    const result = await mppx.charge({
+    const result = await charge({
       amount: String(chargeOpts.amount),
       description: chargeOpts.description,
     })(request);

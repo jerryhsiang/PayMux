@@ -5,15 +5,17 @@ import { X402Client } from './protocols/x402.js';
 import { MppClient } from './protocols/mpp.js';
 import { SpendingEnforcer } from './spending.js';
 import { verifyAmountConsistency } from './utils.js';
+import { probeMppAmount } from './protocols/mpp-probe.js';
 
 /**
  * Cached protocol detection result for a URL.
  *
  * After the first probe detects a protocol for a given URL, we cache the
- * mapping so subsequent requests skip the redundant PayMux probe.
- * This is critical for MPP: mppx.fetch() performs its own probe internally,
- * so without caching, every MPP request would make 3 HTTP calls (PayMux probe
- * + mppx probe + mppx paid retry) instead of 2 (mppx probe + mppx paid retry).
+ * mapping so subsequent requests skip the full protocol detection logic.
+ * For MPP: cached URLs go through a lightweight MPP-specific probe to
+ * extract the payment amount, enforce spending limits, then delegate to
+ * mppx.fetch(). This ensures spending limits are always checked BEFORE
+ * payment, while skipping the heavier multi-protocol detection.
  */
 interface CachedProtocol {
   protocol: Protocol;
@@ -64,15 +66,18 @@ export class PayMux {
  * 4. Total: 3 HTTP calls (first call only)
  *
  * Flow (MPP — subsequent calls to a cached URL):
- * 1. Protocol cache hit — skip PayMux probe (0 HTTP calls)
- * 2. mppx.fetch() runs its own probe + paid retry — 2 HTTP calls
- * 3. Total: 2 HTTP calls
+ * 1. Protocol cache hit — skip full protocol detection
+ * 2. MPP-specific probe to extract amount — 1 HTTP call
+ * 3. Enforce spending limits BEFORE payment
+ * 4. mppx.fetch() runs its own probe + paid retry — 2 HTTP calls
+ * 5. Total: 3 HTTP calls (same as first call, but skips protocol detection)
  *
  * For x402: signs directly from the probe's PAYMENT-REQUIRED header using
  * @x402/core (bypasses wrapFetchWithPayment which would make a redundant request).
  * For MPP: mppx.fetch() handles its own 402 challenge/response flow. After the
  * first probe detects MPP, the URL→protocol mapping is cached so subsequent
- * requests skip the redundant PayMux probe (2 calls instead of 3).
+ * requests skip the full protocol detection logic and go directly to an
+ * MPP-specific probe + spending limit check + mppx.fetch().
  */
 export class PayMuxClient {
   private x402Client: X402Client | null = null;
@@ -136,18 +141,18 @@ export class PayMuxClient {
 
     this.log(`[paymux] [>] ${fetchInit.method ?? 'GET'} ${urlString}`);
 
-    // ── MPP fast path: skip PayMux probe for cached MPP URLs ──────────
+    // ── MPP fast path: skip full protocol detection for cached MPP URLs ─
     // After the first request to a URL detects MPP, we cache the mapping.
-    // On subsequent requests, we skip the PayMux probe entirely and let
-    // mppx.fetch() handle everything (it does its own 402 probe internally).
-    // This reduces MPP from 3 HTTP calls (PayMux probe + mppx probe + paid retry)
-    // to 2 HTTP calls (mppx probe + paid retry).
+    // On subsequent requests, we skip the full PayMux protocol detection
+    // (which parses x402 headers, body, etc.) and go directly to an
+    // MPP-specific probe that extracts the payment amount, enforces
+    // spending limits BEFORE payment, then delegates to mppx.fetch().
     //
     // We only use the fast path when:
     // - No forced protocol override (protocol option)
     // - The cache entry hasn't expired (5 minute TTL)
-    // If the endpoint stops requiring payment, mppx.fetch() will get a 200
-    // on its probe and return it directly — no wasted work.
+    // If the endpoint stops requiring payment, the probe detects this
+    // and returns the non-402 response directly.
     if (!protocol) {
       const cached = this.getCachedProtocol(urlString);
       if (cached === 'mpp') {
@@ -349,21 +354,23 @@ export class PayMuxClient {
   // ── Protocol cache methods ──────────────────────────────────────────
 
   /**
-   * MPP fast path — skip the PayMux probe and let mppx.fetch() handle everything.
+   * MPP fast path — known-MPP URL with spending limits enforced BEFORE payment.
    *
-   * When the protocol cache tells us a URL speaks MPP, we bypass our own
-   * probe and go directly to mppx.fetch(), which does its own 402 detection
-   * internally. This saves one HTTP round-trip on repeat requests.
+   * When the protocol cache tells us a URL speaks MPP, we skip the full
+   * PayMux protocol detection (which parses x402 headers, body, etc.) and
+   * go directly to an MPP-specific probe to extract the payment amount.
    *
-   * Spending limits are still enforced: mppx.fetch() returns the response,
-   * and we extract the payment amount from the Payment-Receipt header after
-   * the fact. If the endpoint no longer requires payment (returns 200 without
-   * Payment-Receipt), we return the response directly with no spending impact.
+   * Flow (3 HTTP calls):
+   *   1. MPP probe — plain fetch to get the 402 + WWW-Authenticate amount
+   *   2. Spending limit check (perRequest, perDay, maxAmount) — BEFORE payment
+   *   3. mppx.fetch() — handles its own probe + paid retry (2 HTTP calls)
    *
-   * Note: On the fast path, we cannot enforce per-request spending limits
-   * BEFORE the payment happens (since mppx handles probe + pay atomically).
-   * The maxAmount check is done post-payment on the receipt. For strict
-   * pre-payment enforcement, the standard path (first call) still applies.
+   * This is the same number of HTTP calls as the normal first-request path,
+   * but skips the heavier protocol detection logic. The key guarantee:
+   * **spending limits are ALWAYS enforced before money leaves the wallet.**
+   *
+   * If the endpoint no longer returns 402, we evict the cache entry and
+   * return the non-402 response directly (no payment, no spending impact).
    */
   private async mppFastPath(
     url: string,
@@ -377,48 +384,62 @@ export class PayMuxClient {
       );
     }
 
-    // Let mppx.fetch() handle the full 402 → challenge → sign → retry flow.
-    // This is 2 HTTP calls: mppx probe + mppx paid retry.
-    const { response, result } = await this.mppClient.pay(url, init);
+    // Step 1: Probe to extract amount BEFORE paying
+    const probeResult = await probeMppAmount(url, init);
 
-    // If no payment was made (endpoint returned non-402 to mppx), return directly.
-    // This handles the case where the server stopped requiring payment after caching.
+    // If probe returned non-402, endpoint no longer requires payment
+    if (!probeResult) {
+      this.log(`[paymux] [<] MPP fast path — endpoint no longer requires payment`);
+      // Evict stale cache entry
+      this.protocolCache.delete(this.getCacheKey(url));
+      // Re-fetch to return the actual non-402 response to the caller.
+      // (The probe consumed the response, so we need a fresh one.)
+      return globalThis.fetch(url, init);
+    }
+
+    const amountUsd = probeResult.amountUsd;
+
+    this.log(
+      `[paymux] [probe] MPP fast path: $${amountUsd.toFixed(6)} (raw: ${probeResult.amountRaw} ${probeResult.currency})`
+    );
+
+    // Step 2: ENFORCE SPENDING LIMITS — all checks BEFORE payment
+    // maxAmount ceiling check (USD)
+    if (maxAmount !== undefined && amountUsd > maxAmount) {
+      throw new Error(
+        `PayMux: Payment of $${amountUsd.toFixed(6)} exceeds maxAmount of $${maxAmount.toFixed(2)}`
+      );
+    }
+
+    // Per-request + per-day limits in USD (reserves amount as pending)
+    this.spendingEnforcer.check(amountUsd);
+
+    // Step 3: Pay via mppx — release pending on failure
+    let response: Response;
+    let result: PaymentResult;
+
+    try {
+      const payResult = await this.mppClient.pay(url, init);
+      response = payResult.response;
+      result = payResult.result;
+    } catch (error) {
+      // Release the pending reservation so failed payments don't
+      // permanently reduce daily spending capacity
+      this.spendingEnforcer.release(amountUsd);
+      throw error;
+    }
+
+    // If mppx got a non-402 (server changed between our probe and mppx's probe),
+    // release the pending amount since no payment was made
     if (!result.receipt) {
-      this.log(`[paymux] [<] ${response.status} (MPP fast path — no payment needed)`);
-      // Evict cache since this URL no longer requires payment
+      this.spendingEnforcer.release(amountUsd);
+      this.log(`[paymux] [<] ${response.status} (MPP fast path — no payment on retry)`);
       this.protocolCache.delete(this.getCacheKey(url));
       return response;
     }
 
-    // Payment was made — enforce spending limits post-payment
-    const amountUsd = parseFloat(result.amount);
-
-    if (maxAmount !== undefined && amountUsd > maxAmount) {
-      // Payment already happened but exceeded maxAmount. Log a warning.
-      // We can't undo the payment, but we surface the violation.
-      this.log(
-        `[paymux] [warn] MPP fast path: payment of $${amountUsd.toFixed(6)} exceeded maxAmount of $${maxAmount.toFixed(2)} (payment already settled)`
-      );
-    }
-
-    // Record the payment in spending tracking.
-    // On the fast path, the payment has already settled, so we can't prevent it.
-    // We still call check() to validate limits — if it throws (limit exceeded),
-    // we catch and log a warning but still record the payment so daily spend
-    // tracking stays accurate. The first call to any URL always uses the
-    // standard path with pre-payment enforcement, so this is a rare edge case.
-    try {
-      this.spendingEnforcer.check(amountUsd);
-      this.spendingEnforcer.record(amountUsd);
-    } catch {
-      // Limit exceeded post-payment — record it anyway to keep tracking accurate.
-      // The pending amount was never reserved (check threw), so call record
-      // directly which only updates dailySpend and totalSpent.
-      this.spendingEnforcer.record(amountUsd);
-      this.log(
-        `[paymux] [warn] MPP fast path: spending limit exceeded after payment settled ($${amountUsd.toFixed(6)})`
-      );
-    }
+    // Step 4: Record successful payment (moves from pending to confirmed)
+    this.spendingEnforcer.record(amountUsd);
     this.paymentHistory.push(result);
 
     if (this.paymentHistory.length > PayMuxClient.MAX_HISTORY) {

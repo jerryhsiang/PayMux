@@ -107,20 +107,18 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 npm install paymux
 ```
 
-Peer dependencies (install what you need):
+Then install peer dependencies for the protocols you need:
+
+| Protocol | Peer Dependencies | Install Command |
+|----------|------------------|-----------------|
+| **x402** (Coinbase) | `@x402/core` `@x402/evm` `viem` | `npm install @x402/core @x402/evm viem` |
+| **MPP** (Stripe/Tempo) | `mppx` `viem` | `npm install mppx viem` |
+| **Both protocols** | All of the above | `npm install @x402/core @x402/evm mppx viem` |
+
+For server middleware, also install your framework:
 
 ```bash
-# For x402 payments (Coinbase/Cloudflare)
-npm install @x402/core @x402/evm viem
-
-# For MPP payments (Stripe/Tempo)
-npm install mppx viem
-
-# For Express server middleware
-npm install express
-
-# For Hono / Cloudflare Workers server middleware
-npm install hono
+npm install express  # or: npm install hono
 ```
 
 ---
@@ -168,14 +166,13 @@ const data = await response.json();
 
 ```typescript
 import express from 'express';
-import crypto from 'crypto';
 import { PayMuxServer } from 'paymux/server';
 
 const app = express();
 const payments = PayMuxServer.create({
   accept: ['mpp'],
   mpp: {
-    secretKey: crypto.randomBytes(32).toString('base64'),
+    secretKey: process.env.MPP_SECRET_KEY!, // See "MPP Configuration" below
     tempoRecipient: '0xYourWalletAddress',
     testnet: true, // false for mainnet
   },
@@ -210,7 +207,7 @@ const payments = PayMuxServer.create({
   accept: ['x402', 'mpp'],
   x402: { recipient: '0x...', chain: 'base' },
   mpp: {
-    secretKey: crypto.randomBytes(32).toString('base64'),
+    secretKey: process.env.MPP_SECRET_KEY!,
     tempoRecipient: '0x...',
   },
 });
@@ -225,6 +222,58 @@ git clone https://github.com/jerryhsiang/PayMux.git
 cd PayMux/examples/quickstart
 npm install
 npm run demo
+```
+
+---
+
+## MPP Configuration
+
+The MPP server config has three fields that need explanation:
+
+### `secretKey` — HMAC verification key
+
+The `secretKey` is an HMAC key used for stateless verification of payment challenges. It binds each 402 challenge to its contents so the server can verify payments without storing session state.
+
+**Generate it once and store it permanently.** It must persist across server restarts and deploys. If you rotate it, all in-flight payment challenges become invalid.
+
+```bash
+# Generate once, add to your .env
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+```env
+MPP_SECRET_KEY=your_generated_key_here
+```
+
+```typescript
+mpp: {
+  secretKey: process.env.MPP_SECRET_KEY!, // Persistent key from .env — NOT crypto.randomBytes()
+}
+```
+
+### `tempoRecipient` — Your wallet on Tempo chain
+
+[Tempo](https://tempo.xyz) is a sub-second finality blockchain (EVM-compatible) purpose-built for payments by the team behind MPP. Settlement costs <$0.001. Payments settle in **PathUSD**, a USD-pegged stablecoin native to Tempo.
+
+`tempoRecipient` is a standard Ethereum/EVM wallet address where PathUSD payments land. Any EVM address works -- you do not need a special Tempo account.
+
+For testnet development, create an auto-funded account:
+
+```bash
+npm i -g mppx
+mppx account create   # Generates a wallet and funds it on Tempo testnet
+```
+
+### `stripeSecretKey` — Optional card-based MPP
+
+When provided, the server accepts both Tempo (crypto) and Stripe (card) payment methods through MPP. Agents that prefer card payments can pay via Stripe, while crypto-native agents pay via Tempo.
+
+```typescript
+mpp: {
+  secretKey: process.env.MPP_SECRET_KEY!,
+  tempoRecipient: '0x...',
+  stripeSecretKey: process.env.STRIPE_SECRET_KEY, // Optional: enables card payments via MPP
+}
 ```
 
 ---
@@ -273,7 +322,7 @@ All chains use USDC with correct contract addresses.
 | Layer | Technology |
 |-------|-----------|
 | Runtime | Node.js >= 18 / TypeScript |
-| x402 | `@x402/fetch`, `@x402/core`, `@x402/evm` |
+| x402 | `@x402/core`, `@x402/evm` |
 | MPP | `mppx` (client + server) |
 | Signing | `viem` |
 | Frameworks | Express, Hono, Cloudflare Workers |

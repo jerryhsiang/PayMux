@@ -54,9 +54,50 @@ export type MiddlewareHandler = (
 ) => Promise<Response | null>;
 
 /**
- * Universal PayMux middleware returned by charge().
- * Works as Express middleware (3 args) or Hono middleware (2 args).
+ * Middleware typed for Express. Cast from `charge()` when using Express.
+ *
+ * @example
+ * ```typescript
+ * const mw = payments.charge({ amount: 0.01 }) as ExpressPayMuxMiddleware;
+ * app.get('/api/data', mw, handler);
+ * ```
  */
-export type PayMuxMiddleware = (...args: unknown[]) => unknown;
+export type ExpressPayMuxMiddleware = (
+  req: { headers: Record<string, string | string[] | undefined>; method: string; url: string; protocol: string; originalUrl: string; get: (name: string) => string | undefined; body?: unknown },
+  res: { status: (code: number) => any; json: (body: any) => any; setHeader: (name: string, value: string) => any; send: (body: any) => any },
+  next: (err?: any) => void
+) => void | Promise<void>;
+
+/**
+ * Middleware typed for Hono. Cast from `charge()` when using Hono.
+ *
+ * @example
+ * ```typescript
+ * const mw = payments.charge({ amount: 0.01 }) as HonoPayMuxMiddleware;
+ * app.get('/api/data', mw, handler);
+ * ```
+ */
+export type HonoPayMuxMiddleware = (
+  c: { req: { raw: Request; url: string; header: (name: string) => string | undefined }; json: (body: any, status?: number) => any; header: (name: string, value: string) => void; status: (code: number) => void; res: Response },
+  next: () => Promise<void>
+) => void | Promise<void>;
+
+/**
+ * Universal payment middleware returned by `charge()`.
+ * Auto-detects Express (3 args) or Hono (2 args) at runtime.
+ *
+ * For full IDE type safety, cast to `ExpressPayMuxMiddleware` or `HonoPayMuxMiddleware`:
+ *
+ * @example
+ * ```typescript
+ * // Express
+ * const mw = payments.charge({ amount: 0.01 }) as ExpressPayMuxMiddleware;
+ *
+ * // Hono
+ * const mw = payments.charge({ amount: 0.01 }) as HonoPayMuxMiddleware;
+ * ```
+ */
+export type PayMuxMiddleware = ((...args: any[]) => void | Promise<void>)
+  & { __brand?: 'PayMuxMiddleware' };
 
 export type { ChargeOptions };

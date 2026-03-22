@@ -59,7 +59,7 @@ app.get(
 );
 
 // ── Start server ────────────────────────────────────────────────
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3001;
 app.listen(PORT, () => {
   console.log('');
   console.log('🚀 PayMux Quickstart Server running!');

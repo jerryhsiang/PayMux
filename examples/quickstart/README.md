@@ -2,7 +2,9 @@
 
 Make your first agent payment in 5 minutes.
 
-## Quick Demo (no wallet needed)
+## Quick Demos (no wallet needed)
+
+### x402 Demo
 
 ```bash
 cd examples/quickstart
@@ -16,6 +18,19 @@ This runs a paid API and an agent in the same process, showing:
 - PayMux auto-detects the protocol
 - Spending limits block overspend before payment
 - Clear error messages at every step
+
+### MPP Demo
+
+```bash
+npm run mpp-demo
+```
+
+Shows the MPP (Micropayments Protocol / Stripe/Tempo) flow:
+- Server returns 402 with `WWW-Authenticate: Payment` challenge headers
+- PayMux auto-detects MPP and extracts amount, currency, and method
+- Spending limits enforce budgets before any payment attempt
+- Dual-protocol detection when a server supports both MPP and x402
+- Side-by-side comparison of MPP vs x402 headers and flow
 
 ## Full Demo (with testnet payments)
 
@@ -40,12 +55,12 @@ You'll see:
 ```
 🚀 PayMux Quickstart Server running!
 
-   Free:  http://localhost:3000/api/time
-   Paid:  http://localhost:3000/api/joke  ($0.01)
+   Free:  http://localhost:3001/api/time
+   Paid:  http://localhost:3001/api/joke  ($0.01)
 
 Try it:
-   curl http://localhost:3000/api/time     # Free — works
-   curl http://localhost:3000/api/joke     # Paid — returns 402
+   curl http://localhost:3001/api/time     # Free — works
+   curl http://localhost:3001/api/joke     # Paid — returns 402
 ```
 
 ### 3. Run the paying agent
@@ -61,13 +76,13 @@ You'll see:
 🤖 PayMux Agent starting...
 
 ── Step 1: Fetching free endpoint ──
-[paymux] [>] GET http://localhost:3000/api/time
+[paymux] [>] GET http://localhost:3001/api/time
 [paymux] [<] 200 (no payment required)
 Result: { time: '2026-03-22T...' }
 Spending so far: $0.00
 
 ── Step 2: Fetching paid endpoint ($0.01) ──
-[paymux] [>] GET http://localhost:3000/api/joke
+[paymux] [>] GET http://localhost:3001/api/joke
 [paymux] [<] 402 Payment Required — detecting protocol...
 [paymux]   Protocol: x402 | Amount: $0.010000 (raw: 10000 0x036C...)
 [paymux] [ok] Paid $0.010000 via x402 | tx: 0x...
@@ -110,13 +125,14 @@ const agent = PayMux.create({
   limits: { perRequest: 0.10, perDay: 1.00 },
 });
 
-const response = await agent.fetch('http://localhost:3000/api/joke');
+const response = await agent.fetch('http://localhost:3001/api/joke');
 const data = await response.json(); // { joke: '...', price: '$0.01' }
 ```
 
-## MPP Demo (Tempo testnet)
+## MPP — Real Payments (Tempo testnet)
 
-For MPP payments via Stripe/Tempo:
+The `npm run mpp-demo` command above shows MPP detection without a wallet.
+To make real MPP payments on the Tempo testnet:
 
 ```bash
 # Install mppx CLI and create a testnet account (auto-funded)

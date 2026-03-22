@@ -7,7 +7,8 @@
   "scripts": {
     "server": "tsx server.ts",
     "agent": "tsx agent.ts",
-    "demo": "tsx demo.ts"
+    "demo": "tsx demo.ts",
+    "mpp-demo": "tsx mpp-demo.ts"
   },
   "dependencies": {
     "express": "^4.21.0",
