@@ -101,6 +101,134 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 
 ---
 
+## Install
+
+```bash
+npm install paymux
+```
+
+Peer dependencies (install what you need):
+
+```bash
+# For x402 payments (Coinbase/Cloudflare)
+npm install @x402/core @x402/evm viem
+
+# For MPP payments (Stripe/Tempo)
+npm install mppx viem
+
+# For Express server middleware
+npm install express
+
+# For Hono / Cloudflare Workers server middleware
+npm install hono
+```
+
+---
+
+## Quick Start
+
+### x402 (Coinbase) — Server
+
+```typescript
+import express from 'express';
+import { PayMuxServer } from 'paymux/server';
+
+const app = express();
+const payments = PayMuxServer.create({
+  accept: ['x402'],
+  x402: {
+    recipient: '0xYourWalletAddress',
+    chain: 'base-sepolia', // or 'base' for mainnet
+  },
+});
+
+app.get('/api/data',
+  payments.charge({ amount: 0.01, currency: 'USD' }),
+  (req, res) => res.json({ data: 'premium content' })
+);
+
+app.listen(3000);
+```
+
+### x402 (Coinbase) — Agent
+
+```typescript
+import { PayMux } from 'paymux';
+
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  limits: { perRequest: 1.00, perDay: 200.00 },
+});
+
+const response = await agent.fetch('http://localhost:3000/api/data');
+const data = await response.json();
+```
+
+### MPP (Stripe/Tempo) — Server
+
+```typescript
+import express from 'express';
+import crypto from 'crypto';
+import { PayMuxServer } from 'paymux/server';
+
+const app = express();
+const payments = PayMuxServer.create({
+  accept: ['mpp'],
+  mpp: {
+    secretKey: crypto.randomBytes(32).toString('base64'),
+    tempoRecipient: '0xYourWalletAddress',
+    testnet: true, // false for mainnet
+  },
+});
+
+app.get('/api/data',
+  payments.charge({ amount: 0.01 }),
+  (req, res) => res.json({ data: 'premium content' })
+);
+
+app.listen(3000);
+```
+
+### MPP (Stripe/Tempo) — Agent
+
+```typescript
+import { PayMux } from 'paymux';
+
+// Same code as x402 — PayMux auto-detects the protocol
+const agent = PayMux.create({
+  wallet: { privateKey: '0x...' },
+  limits: { perRequest: 1.00, perDay: 200.00 },
+});
+
+const response = await agent.fetch('http://localhost:3000/api/data');
+```
+
+### Both Protocols — Server accepts x402 AND MPP
+
+```typescript
+const payments = PayMuxServer.create({
+  accept: ['x402', 'mpp'],
+  x402: { recipient: '0x...', chain: 'base' },
+  mpp: {
+    secretKey: crypto.randomBytes(32).toString('base64'),
+    tempoRecipient: '0x...',
+  },
+});
+```
+
+The agent code doesn't change — `agent.fetch()` works with any protocol.
+
+### Try it locally (no wallet needed)
+
+```bash
+git clone https://github.com/jerryhsiang/PayMux.git
+cd PayMux/examples/quickstart
+npm install
+npm run demo
+```
+
+---
+
 ## Supported Chains
 
 | Chain | Network ID | Status |
