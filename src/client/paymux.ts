@@ -315,6 +315,11 @@ export class PayMuxClient {
     if (shouldCheckSpending) {
       this.spendingEnforcer.record(amountUsd);
     }
+
+    // CRITICAL: Set amountUsd on the PaymentResult so downstream consumers
+    // (e.g., session spending tracking) use the converted USD amount, not raw
+    // base units. Without this, parseFloat("10000") would be $10,000 not $0.01.
+    result.amountUsd = amountUsd;
     this.recordPayment(result);
 
     this.logger.info(
@@ -606,6 +611,11 @@ export class PayMuxClient {
     if (shouldCheckSpendingFP) {
       this.spendingEnforcer.record(amountUsd);
     }
+
+    // CRITICAL: Set amountUsd on the PaymentResult so downstream consumers
+    // (e.g., session spending tracking) use the converted USD amount, not raw
+    // base units. Without this, parseFloat("10000") would be $10,000 not $0.01.
+    result.amountUsd = amountUsd;
     this.recordPayment(result);
 
     this.logger.info(

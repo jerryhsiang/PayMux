@@ -603,11 +603,11 @@ describe('PayMux client', () => {
     it('session budget enforcement — tracks spending from parent history', async () => {
       // The session now tracks spending from the parent client's payment history,
       // not from receipt headers. This works for both x402 and MPP protocols.
-      const parentHistory: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+      const parentHistory: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
 
       const mockFetch = vi.fn().mockImplementation(async () => {
         // Simulate the parent client recording a payment during fetch
-        parentHistory.push({ amount: '0.02', protocol: 'mpp', settledAt: Date.now() });
+        parentHistory.push({ amount: '0.02', amountUsd: 0.02, protocol: 'mpp', settledAt: Date.now() });
         return new Response(JSON.stringify({ result: 'ok' }), { status: 200 });
       });
 

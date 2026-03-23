@@ -13,7 +13,7 @@ import { SpendingEnforcer, SpendingLimitError } from './spending.js';
 export interface SessionFetchDelegate {
   fetch(url: string | URL, init?: RequestInit & { skipSpendingCheck?: boolean }): Promise<Response>;
   /** Access the parent client's spending history to find the last payment amount. */
-  readonly spending: { history: Array<{ amount: string; protocol: string; settledAt?: number }> };
+  readonly spending: { history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> };
 }
 
 /**
@@ -172,9 +172,12 @@ export class PayMuxSession {
     let spentAmount = 0;
 
     if (historyAfter.length > historyBefore) {
-      // The parent client recorded a new payment during our fetch
+      // The parent client recorded a new payment during our fetch.
+      // CRITICAL: Use amountUsd (converted from base units), NOT parseFloat(amount).
+      // PaymentResult.amount is the raw server amount which may be in base units
+      // (e.g., "10000" for $0.01 USDC). parseFloat("10000") would be $10,000.
       const lastPayment = historyAfter[historyAfter.length - 1];
-      spentAmount = parseFloat(lastPayment.amount) || 0;
+      spentAmount = lastPayment.amountUsd ?? (parseFloat(lastPayment.amount) || 0);
     }
 
     // Update session spending state

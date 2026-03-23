@@ -184,16 +184,37 @@ Then install peer dependencies for the protocols you need:
 | **MPP** (Stripe/Tempo) | `mppx` `viem` | `npm install mppx viem` |
 | **Both protocols** | All of the above | `npm install @x402/core @x402/evm mppx viem` |
 
-> **Note:** `mppx` requires Express 5+. If you're on Express 4, install with `--legacy-peer-deps`:
-> ```bash
-> npm install mppx viem --legacy-peer-deps
-> ```
-> PayMux's server middleware works with both Express 4 and 5.
+**Warning: `mppx` requires Express 5+.** If you're on Express 4, install with `--legacy-peer-deps`:
+
+```bash
+npm install mppx viem --legacy-peer-deps
+```
+
+PayMux's server middleware works with both Express 4 and 5.
 
 For server middleware, also install your framework:
 
 ```bash
 npm install express  # or: npm install hono
+```
+
+---
+
+## TypeScript Configuration
+
+If you're using TypeScript, add a `tsconfig.json` with ESM and Node16 resolution:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "Node16",
+    "moduleResolution": "Node16",
+    "esModuleInterop": true,
+    "strict": true,
+    "outDir": "dist"
+  }
+}
 ```
 
 ---

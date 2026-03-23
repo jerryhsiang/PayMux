@@ -1,6 +1,103 @@
 import type { PaymentRequirement, PaymentResult, WalletConfig, X402Receipt } from '../../shared/types.js';
 
 /**
+ * Known EIP-712 domain parameters for USDC by CAIP-2 network ID.
+ *
+ * Used as fallback defaults when a third-party x402 server omits `extra.name`
+ * and `extra.version` from its PaymentRequired response. Without these, @x402/evm's
+ * `signEIP3009Authorization()` throws:
+ *   "EIP-712 domain parameters (name, version) are required"
+ *
+ * Values sourced from the USDC token contracts on each chain.
+ * The `name` is the token's ERC-20 name() and `version` is its EIP-712 domain version.
+ */
+const USDC_EIP712_DEFAULTS: Record<string, { name: string; version: string }> = {
+  'eip155:8453':     { name: 'USD Coin', version: '2' },   // Base mainnet
+  'eip155:84532':    { name: 'USDC',     version: '2' },   // Base Sepolia
+  'eip155:137':      { name: 'USD Coin', version: '2' },   // Polygon mainnet
+  'eip155:80002':    { name: 'USD Coin', version: '2' },   // Polygon Amoy
+  'eip155:1':        { name: 'USD Coin', version: '2' },   // Ethereum mainnet
+  'eip155:11155111': { name: 'USDC',     version: '2' },   // Ethereum Sepolia
+};
+
+/**
+ * Known USDC contract addresses by CAIP-2 network ID.
+ * Used to match `asset` fields against known USDC tokens when looking up
+ * EIP-712 domain defaults.
+ */
+const KNOWN_USDC_ADDRESSES: Set<string> = new Set([
+  '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', // Base mainnet
+  '0x036CbD53842c5426634e7929541eC2318f3dCF7e', // Base Sepolia
+  '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359', // Polygon mainnet
+  '0x41E94Eb71Ef8C9863E91B9C684D4e1B9F5B1EeA5', // Polygon Amoy
+  '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // Ethereum mainnet
+  '0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238', // Ethereum Sepolia
+]);
+
+/**
+ * Inject EIP-712 domain defaults into a PaymentRequired object.
+ *
+ * When a third-party x402 server omits `extra.name` and `extra.version` from
+ * its 402 response, @x402/evm >= 2.7.0 throws because it needs these fields
+ * to construct the EIP-712 domain for `transferWithAuthorization` signing.
+ *
+ * This function walks the `accepts` array and adds defaults for known USDC
+ * tokens on supported chains. If the server already includes `extra.name`
+ * and `extra.version`, those values are preserved (server takes precedence).
+ *
+ * If the asset/network combination is unrecognized, no defaults are injected
+ * and @x402/evm will throw its normal error — this is intentional since we
+ * can't guess the EIP-712 domain for arbitrary tokens.
+ */
+function injectEip712Defaults(paymentRequired: Record<string, unknown>): Record<string, unknown> {
+  const accepts = paymentRequired.accepts;
+  if (!accepts || !Array.isArray(accepts)) {
+    return paymentRequired;
+  }
+
+  const enrichedAccepts = accepts.map((entry: Record<string, unknown>) => {
+    const extra = (entry.extra ?? {}) as Record<string, unknown>;
+
+    // If the server already provided name and version, keep them
+    if (extra.name && extra.version) {
+      return entry;
+    }
+
+    const network = String(entry.network ?? '');
+    const asset = String(entry.asset ?? '');
+
+    // Only inject defaults for known USDC tokens on known chains
+    const domainDefaults = USDC_EIP712_DEFAULTS[network];
+    if (!domainDefaults) {
+      return entry;
+    }
+
+    // Verify this is actually a USDC token (case-insensitive address match)
+    const isKnownUsdc = KNOWN_USDC_ADDRESSES.has(asset) ||
+      [...KNOWN_USDC_ADDRESSES].some(addr => addr.toLowerCase() === asset.toLowerCase());
+
+    if (!isKnownUsdc) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      extra: {
+        ...extra,
+        // Only fill in missing fields — preserve any server-provided values
+        name: extra.name ?? domainDefaults.name,
+        version: extra.version ?? domainDefaults.version,
+      },
+    };
+  });
+
+  return {
+    ...paymentRequired,
+    accepts: enrichedAccepts,
+  };
+}
+
+/**
  * x402 payment client — uses @x402/core directly for payment signing.
  *
  * Architecture (2 HTTP calls, not 3):
@@ -88,9 +185,16 @@ export class X402Client {
       );
     }
 
-    const paymentRequired = httpClient.getPaymentRequiredResponse(
+    const rawPaymentRequired = httpClient.getPaymentRequiredResponse(
       (name: string) => probeResponse.headers.get(name)
-    );
+    ) as Record<string, unknown>;
+
+    // Inject EIP-712 domain defaults for known USDC tokens.
+    // Third-party x402 servers may omit extra.name/extra.version, which causes
+    // @x402/evm >= 2.7.0 to throw "EIP-712 domain parameters (name, version)
+    // are required". This fills in sensible defaults without overriding
+    // server-provided values.
+    const paymentRequired = injectEip712Defaults(rawPaymentRequired);
 
     // Step 2: Create signed payment payload (pure local crypto, NO HTTP call)
     const paymentPayload = await coreClient.createPaymentPayload(paymentRequired);

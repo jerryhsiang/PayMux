@@ -46,8 +46,20 @@ export type PaymentReceipt = X402Receipt | MppReceipt;
  */
 export interface PaymentResult {
   protocol: Protocol;
+  /** Raw amount string from the server (may be base units for x402/MPP with token addresses) */
   amount: string;
   currency: string;
+  /**
+   * Amount converted to USD for spending tracking and display.
+   *
+   * For x402: base units converted via token decimals (e.g., "10000" -> 0.01 for 6-decimal USDC)
+   * For MPP with token address currency: same base-unit conversion
+   * For MPP with fiat currency (e.g., "USD"): same as parseFloat(amount)
+   *
+   * CRITICAL: Always use this field for spending calculations, NOT parseFloat(amount).
+   * parseFloat(amount) on base units would treat $0.01 as $10,000.
+   */
+  amountUsd?: number;
   transactionHash?: string;
   /**
    * Protocol-specific receipt data.
@@ -70,8 +82,9 @@ export interface PaymentRequirement {
   currency: string;
   /**
    * Amount converted to USD for spending limit comparison.
-   * For x402: base units converted via token decimals (e.g., "10000" → 0.01 for USDC)
-   * For MPP: same as parseFloat(amount)
+   * For x402: base units converted via token decimals (e.g., "10000" -> 0.01 for USDC)
+   * For MPP with token address currency: base units converted via token decimals
+   * For MPP with fiat currency (e.g., "USD"): same as parseFloat(amount)
    * This is what the SpendingEnforcer checks against perRequest/perDay limits.
    */
   amountUsd?: number;

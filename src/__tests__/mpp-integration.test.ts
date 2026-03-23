@@ -465,11 +465,11 @@ describe('MPP Integration: skipSpendingCheck prevents double-charging', () => {
 
 describe('MPP Integration: Session spending tracking from parent history', () => {
   it('tracks spending when parent records a payment', async () => {
-    const history: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
 
     const mockFetch = vi.fn().mockImplementation(async () => {
       // Simulate the parent client recording a payment
-      history.push({ amount: '0.05', protocol: 'mpp', settledAt: Date.now() });
+      history.push({ amount: '0.05', amountUsd: 0.05, protocol: 'mpp', settledAt: Date.now() });
       return new Response(JSON.stringify({ data: 'ok' }), { status: 200 });
     });
 
@@ -495,10 +495,10 @@ describe('MPP Integration: Session spending tracking from parent history', () =>
   });
 
   it('tracks cumulative spending across multiple requests', async () => {
-    const history: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
 
     const mockFetch = vi.fn().mockImplementation(async () => {
-      history.push({ amount: '0.02', protocol: 'mpp', settledAt: Date.now() });
+      history.push({ amount: '0.02', amountUsd: 0.02, protocol: 'mpp', settledAt: Date.now() });
       return new Response(JSON.stringify({ data: 'ok' }), { status: 200 });
     });
 
@@ -523,9 +523,78 @@ describe('MPP Integration: Session spending tracking from parent history', () =>
     expect(session.spending.requestCount).toBe(3);
   });
 
+  it('CRITICAL: uses amountUsd not parseFloat(amount) for base-unit MPP amounts', async () => {
+    // Regression test: When MPP uses token addresses (real mppx servers), the
+    // PaymentResult.amount is in base units (e.g., "10000" for $0.01 USDC).
+    // The session MUST use amountUsd (0.01), NOT parseFloat("10000") = 10000.
+    // Without the fix, a $0.01 payment would be tracked as $10,000.
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
+
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      // Simulate a payment with base-unit amount (as from a real mppx server).
+      // Raw amount is "10000" (base units), but amountUsd is 0.01 (converted).
+      history.push({
+        amount: '10000',       // Raw base units -- parseFloat would give 10000!
+        amountUsd: 0.01,       // Correctly converted: 10000 / 10^6 = $0.01
+        protocol: 'mpp',
+        settledAt: Date.now(),
+      });
+      return new Response(JSON.stringify({ data: 'ok' }), { status: 200 });
+    });
+
+    const delegate: SessionFetchDelegate = {
+      fetch: mockFetch,
+      spending: { history },
+    };
+
+    const enforcer = new SpendingEnforcer({});
+    const session = new PayMuxSession(
+      delegate,
+      { url: 'https://api.example.com', budget: 5.00 },
+      enforcer
+    );
+
+    await session.fetch('/api/data');
+
+    // The session should track $0.01 spent, NOT $10,000
+    expect(session.spending.spent).toBe(0.01);
+    expect(session.spending.remaining).toBe(4.99);
+    expect(session.spending.requestCount).toBe(1);
+  });
+
+  it('falls back to parseFloat(amount) when amountUsd is not set', async () => {
+    // Backward compatibility: if amountUsd is not set on the PaymentResult
+    // (e.g., older code path), fall back to parseFloat(amount).
+    // This only works correctly for fiat amounts, not base units.
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
+
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      // No amountUsd -- falls back to parseFloat("0.05") = 0.05
+      history.push({ amount: '0.05', protocol: 'mpp', settledAt: Date.now() });
+      return new Response(JSON.stringify({ data: 'ok' }), { status: 200 });
+    });
+
+    const delegate: SessionFetchDelegate = {
+      fetch: mockFetch,
+      spending: { history },
+    };
+
+    const enforcer = new SpendingEnforcer({});
+    const session = new PayMuxSession(
+      delegate,
+      { url: 'https://api.example.com', budget: 5.00 },
+      enforcer
+    );
+
+    await session.fetch('/api/data');
+
+    expect(session.spending.spent).toBe(0.05);
+    expect(session.spending.remaining).toBe(4.95);
+  });
+
   it('does not count spending for free (non-payment) requests', async () => {
     // Parent does NOT add to history when no payment occurs
-    const history: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
 
     const mockFetch = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: 'free' }), { status: 200 })
@@ -751,13 +820,13 @@ describe('MPP Integration: Server omits currency field for mppx defaults', () =>
 
 describe('MPP Integration: Full session lifecycle accounting', () => {
   it('full lifecycle: open -> fetch (with payments) -> close', async () => {
-    const history: Array<{ amount: string; protocol: string; settledAt?: number }> = [];
+    const history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
     let fetchCount = 0;
 
     const mockFetch = vi.fn().mockImplementation(async () => {
       fetchCount++;
       // Simulate payment on each call
-      history.push({ amount: '0.10', protocol: 'mpp', settledAt: Date.now() });
+      history.push({ amount: '0.10', amountUsd: 0.10, protocol: 'mpp', settledAt: Date.now() });
       return new Response(JSON.stringify({ result: fetchCount }), { status: 200 });
     });
 

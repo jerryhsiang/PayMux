@@ -1,6 +1,6 @@
 {
   "name": "paymux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The easiest way to make your API agent-payable. Multi-protocol payment routing for AI agents.",
   "type": "module",
   "main": "./dist/index.cjs",
