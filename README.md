@@ -42,6 +42,27 @@ const response = await agent.fetch('https://api.example.com/data');
 
 ---
 
+## What's New in v0.2.0
+
+**19 fixes from a deep MPP code-path audit** — 4 critical, 8 high, 7 medium.
+
+| Category | Fix | Impact |
+|----------|-----|--------|
+| **Spending** | `SpendingReservation` tokens | Spending limits stay precise even when server changes price between probe and payment |
+| **Sessions** | Atomic `lastPaymentResult` tracking | Safe with concurrent sessions; replaces fragile history-length comparison |
+| **Sessions** | Auto-close expired sessions | Budget automatically released on expiry — no more orphaned pending spend |
+| **Sessions** | `perRequest` skip for session budgets | A $5 session with `perRequest: $2` now works — budgets are envelopes, not single requests |
+| **Timeouts** | x402 `AbortController` | Payment timeouts actually cancel the HTTP request instead of leaking |
+| **Timeouts** | `MppTimeoutError` + pending preservation | MPP timeout keeps spending reservation as safeguard against untracked background payments |
+| **Server** | Factory cache TTL + collision detection | 1-hour TTL, max 50 entries, 64-bit hash + full config check for multi-tenant safety |
+| **Server** | MPP error details in 402 responses | Agents get specific error messages instead of generic "Payment verification failed" |
+| **Server** | Startup validation for payment methods | Misconfigured MPP (no `tempoRecipient` or `stripeSecretKey`) now fails at server creation, not first request |
+| **Client** | Protocol cache eviction on failure | Failed payments evict the cached protocol so next request does fresh detection |
+
+New exports: `SpendingReservation` (type), `MppTimeoutError` (class).
+
+---
+
 ## The Problem
 
 AI agents need to pay for services. API developers need to get paid by agents. Multiple incompatible payment protocols are now live:
@@ -99,7 +120,8 @@ AI agents need to pay for services. API developers need to get paid by agents. M
 - **EVM wallet support** -- private key-based signing for Base, Polygon, Ethereum
 - **Debug mode** -- `debug: true` for full payment flow logging
 - **Retry logic** -- automatic retries on transient failures (502, 503, 504)
-- **Sessions** -- budget-scoped payment sessions for multi-request workflows
+- **Sessions** -- budget-scoped payment sessions with auto-close on expiry
+- **Timeout safety** -- `AbortController` for x402, `MppTimeoutError` with pending preservation for MPP
 - **Custom timeouts** -- configurable probe and payment settlement timeouts
 - **Custom logger** -- plug in your own structured logger or disable logging entirely
 

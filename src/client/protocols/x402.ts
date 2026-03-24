@@ -203,30 +203,36 @@ export class X402Client {
     const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload);
 
     // Step 4: Make ONE retry request with payment proof
-    // Timeout: if the server hangs after receiving payment, the agent won't
-    // block indefinitely. Uses Promise.race similar to MppClient.
+    // Uses AbortController so the actual fetch is cancelled on timeout,
+    // preventing the server from processing a payment after we've given up.
     const existingHeaders = init?.headers instanceof Headers
       ? Object.fromEntries(init.headers.entries())
       : (init?.headers as Record<string, string> | undefined) ?? {};
 
     const timeoutMs = this.paymentTimeoutMs;
-    const response = await Promise.race([
-      globalThis.fetch(url, {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+    let response: Response;
+    try {
+      response = await globalThis.fetch(url, {
         ...init,
         headers: {
           ...existingHeaders,
           ...paymentHeaders,
         },
-      }),
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(
-            `PayMux: x402 payment timed out after ${timeoutMs}ms. The server may be unreachable. URL: ${url}`
-          )),
-          timeoutMs,
-        )
-      ),
-    ]);
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error(
+          `PayMux: x402 payment timed out after ${timeoutMs}ms. The server may be unreachable. URL: ${url}`
+        );
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeoutId);
+    }
 
     // If we still get a 402, payment was rejected
     if (response.status === 402) {

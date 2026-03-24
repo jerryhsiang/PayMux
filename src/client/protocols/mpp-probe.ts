@@ -48,14 +48,14 @@ export async function probeMppAmount(
 
   // Merge the timeout signal with the caller's signal (if any).
   // AbortSignal.any() is not available in Node 18, so we wire them manually.
-  const callerSignal = init?.signal;
+  const callerSignal = init?.signal as AbortSignal | undefined;
+  let callerAbortHandler: (() => void) | undefined;
   if (callerSignal) {
     if (callerSignal.aborted) {
       controller.abort(callerSignal.reason);
     } else {
-      callerSignal.addEventListener('abort', () => {
-        controller.abort(callerSignal.reason);
-      }, { once: true });
+      callerAbortHandler = () => controller.abort(callerSignal.reason);
+      callerSignal.addEventListener('abort', callerAbortHandler, { once: true });
     }
   }
 
@@ -74,6 +74,10 @@ export async function probeMppAmount(
     throw error;
   } finally {
     clearTimeout(timeoutId);
+    // M3 fix: Remove the abort listener to prevent accumulation
+    if (callerSignal && callerAbortHandler) {
+      callerSignal.removeEventListener('abort', callerAbortHandler);
+    }
   }
 
   // If not 402, the endpoint no longer requires payment

@@ -22,6 +22,8 @@
 export { PayMux } from './client/paymux.js';
 export type { PayMuxClient } from './client/paymux.js';
 export { SpendingLimitError } from './client/spending.js';
+export type { SpendingReservation } from './client/spending.js';
+export { MppTimeoutError } from './client/protocols/mpp.js';
 
 // Sessions
 export { PayMuxSession } from './client/session.js';

@@ -1,12 +1,39 @@
 import type { SpendingLimits } from '../shared/types.js';
 
 /**
+ * Opaque reservation token returned by check().
+ *
+ * Tracks the exact amount that was reserved so that record() and release()
+ * always release precisely what was checked — preventing pending-amount drift
+ * when the actual payment amount differs from the probed amount.
+ */
+export interface SpendingReservation {
+  /** The amount reserved in this check (USD). */
+  readonly amount: number;
+  /** Whether this reservation has already been settled (recorded or released). */
+  readonly settled: boolean;
+}
+
+/**
+ * Internal mutable reservation. The public interface is readonly;
+ * only the SpendingEnforcer can mark it as settled.
+ */
+interface MutableReservation extends SpendingReservation {
+  settled: boolean;
+}
+
+/**
  * Spending enforcer — tracks and enforces payment limits.
  *
  * Uses optimistic locking via pending amounts to handle concurrent requests.
- * When check() is called, the amount is added to pendingSpend.
- * When record() is called, it moves from pending to confirmed.
- * When reject() is called (payment failed), it releases the pending amount.
+ * When check() is called, the amount is added to pendingSpend and a
+ * SpendingReservation token is returned. record() and release() accept the
+ * reservation token to ensure the exact reserved amount is released — preventing
+ * drift when the actual payment differs from the probed amount.
+ *
+ * Legacy record(amount)/release(amount) signatures are still supported for
+ * backward compatibility (session close, etc.) but new code should prefer
+ * the reservation-based overloads.
  */
 export class SpendingEnforcer {
   private dailySpend = 0;
@@ -20,14 +47,20 @@ export class SpendingEnforcer {
 
   /**
    * Check if a payment amount is within limits and reserve it.
-   * The amount is held as "pending" until record() or release() is called.
+   * Returns a SpendingReservation token that must be passed to record() or
+   * release() to settle the reservation. This prevents pending-amount drift
+   * when the actual payment amount differs from what was checked.
+   *
    * Throws if the payment would exceed any limit.
+   *
+   * @param skipPerRequest - If true, skip the per-request limit check.
+   *   Used by openSession() where the budget is an envelope, not a single request.
    */
-  check(amount: number): void {
+  check(amount: number, skipPerRequest?: boolean): SpendingReservation {
     this.resetDailyIfNeeded();
 
     // Per-request limit
-    if (this.limits.perRequest !== undefined && amount > this.limits.perRequest) {
+    if (!skipPerRequest && this.limits.perRequest !== undefined && amount > this.limits.perRequest) {
       throw new SpendingLimitError(
         `Payment of $${amount.toFixed(2)} exceeds per-request limit of $${this.limits.perRequest.toFixed(2)}`,
         'perRequest',
@@ -66,23 +99,67 @@ export class SpendingEnforcer {
 
     // Reserve the amount as pending
     this.pendingSpend += amount;
+
+    return { amount, settled: false } as MutableReservation;
   }
 
   /**
-   * Record a completed payment — moves amount from pending to confirmed
+   * Record a completed payment.
+   *
+   * Overload 1 (preferred): Pass the reservation token. Releases the exact
+   * reserved amount from pending and records `actualAmount` (or the reserved
+   * amount if omitted) as confirmed spending.
+   *
+   * Overload 2 (legacy): Pass a raw number. Releases that amount from pending
+   * and records it as confirmed. Used by session close() which tracks its own
+   * spending separately.
    */
-  record(amount: number): void {
+  record(reservationOrAmount: SpendingReservation | number, actualAmount?: number): void {
     this.resetDailyIfNeeded();
-    this.pendingSpend = Math.max(0, this.pendingSpend - amount);
-    this.dailySpend += amount;
-    this.totalSpent += amount;
+
+    if (typeof reservationOrAmount === 'number') {
+      // Legacy path: raw number
+      const amount = reservationOrAmount;
+      this.pendingSpend = Math.max(0, this.pendingSpend - amount);
+      this.dailySpend += amount;
+      this.totalSpent += amount;
+      return;
+    }
+
+    // Reservation-based path
+    const reservation = reservationOrAmount as MutableReservation;
+    if (reservation.settled) return; // Idempotent — already settled
+    reservation.settled = true;
+
+    // Release the exact reserved amount from pending
+    this.pendingSpend = Math.max(0, this.pendingSpend - reservation.amount);
+
+    // Record the actual amount spent (may differ from the reserved amount
+    // if the server changed the price between probe and payment)
+    const confirmed = actualAmount ?? reservation.amount;
+    this.dailySpend += confirmed;
+    this.totalSpent += confirmed;
   }
 
   /**
-   * Release a pending amount (payment failed or was cancelled)
+   * Release a pending amount (payment failed or was cancelled).
+   *
+   * Overload 1 (preferred): Pass the reservation token.
+   * Overload 2 (legacy): Pass a raw number.
    */
-  release(amount: number): void {
-    this.pendingSpend = Math.max(0, this.pendingSpend - amount);
+  release(reservationOrAmount: SpendingReservation | number): void {
+    if (typeof reservationOrAmount === 'number') {
+      // Legacy path: raw number
+      this.pendingSpend = Math.max(0, this.pendingSpend - reservationOrAmount);
+      return;
+    }
+
+    // Reservation-based path
+    const reservation = reservationOrAmount as MutableReservation;
+    if (reservation.settled) return; // Idempotent — already settled
+    reservation.settled = true;
+
+    this.pendingSpend = Math.max(0, this.pendingSpend - reservation.amount);
   }
 
   /**
@@ -118,8 +195,13 @@ export class SpendingEnforcer {
   }
 
   private resetDailyIfNeeded(): void {
-    if (Date.now() > this.dailyResetAt) {
+    if (Date.now() >= this.dailyResetAt) {
       this.dailySpend = 0;
+      // Also reset pending carry-over from the previous day.
+      // Pending amounts from yesterday should not reduce today's capacity.
+      // If a payment from yesterday eventually settles, record() will add it
+      // to dailySpend (which is acceptable — conservative over-counting).
+      this.pendingSpend = 0;
       this.dailyResetAt = new Date().setUTCHours(24, 0, 0, 0);
     }
   }

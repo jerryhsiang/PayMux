@@ -33,29 +33,65 @@ type MppChargeResult =
  */
 type ChargeFactory = (opts: { amount: string; description?: string }) => MppChargeHandler;
 
+/** Cached entry: factory + original config values for collision detection + creation time for TTL */
+interface CacheEntry {
+  factory: ChargeFactory;
+  /** Original config values for collision detection (not the secret itself) */
+  recipient: string;
+  testnet: string;
+  /** When this entry was created (ms since epoch) */
+  createdAt: number;
+}
+
 /** Per-config factory cache. Keyed by hashed config values, not raw secrets. */
-const factoryCache = new Map<string, ChargeFactory>();
+const factoryCache = new Map<string, CacheEntry>();
+
+/** Maximum number of cached factory entries (prevents unbounded growth from key rotation) */
+const MAX_FACTORY_CACHE_SIZE = 50;
+
+/** TTL for factory cache entries (1 hour). Ensures rotated secrets are eventually evicted. */
+const FACTORY_CACHE_TTL_MS = 60 * 60 * 1000;
 
 const MIN_SECRET_KEY_LENGTH = 32;
 
 /**
  * Fast, non-cryptographic hash for cache key differentiation.
- * Uses FNV-1a (32-bit). This is NOT for security — the mppx instance holds
- * the secret in memory regardless. We hash only to avoid keeping the raw
- * secret key as a Map key string that could surface in heap dumps / debuggers.
+ * Uses FNV-1a (32-bit) combined with DJB2 for a 64-bit key space,
+ * vastly reducing collision risk compared to a single 32-bit hash.
+ *
+ * The cache also performs full config comparison on hit (H4 fix) for
+ * collision safety in multi-tenant deployments.
  *
  * Works in Node, Deno, Bun, and Cloudflare Workers (no `crypto` import needed).
  */
 function hashConfigKey(secretKey: string, recipient: string, testnet: string): string {
   const input = `${secretKey}:${recipient}:${testnet}`;
-  let hash = 0x811c9dc5; // FNV offset basis
+  // Primary hash: FNV-1a 32-bit
+  let h1 = 0x811c9dc5;
   for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    // FNV prime multiply — use Math.imul for correct 32-bit overflow
-    hash = Math.imul(hash, 0x01000193);
+    h1 ^= input.charCodeAt(i);
+    h1 = Math.imul(h1, 0x01000193);
   }
-  // Convert to unsigned 32-bit hex
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  // Secondary hash: DJB2
+  let h2 = 5381;
+  for (let i = 0; i < input.length; i++) {
+    h2 = ((h2 << 5) + h2 + input.charCodeAt(i)) | 0;
+  }
+  // Combine both hashes for 64-bit key space
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Evict expired entries from the factory cache.
+ * Called before inserting new entries to keep the cache bounded.
+ */
+function evictExpiredEntries(): void {
+  const now = Date.now();
+  for (const [key, entry] of factoryCache) {
+    if (now - entry.createdAt > FACTORY_CACHE_TTL_MS) {
+      factoryCache.delete(key);
+    }
+  }
 }
 
 /**
@@ -82,16 +118,26 @@ async function getMppChargeFactory(config: PayMuxServerConfig): Promise<ChargeFa
     );
   }
 
+  const recipient = config.mpp.tempoRecipient ?? '';
+  const testnet = String(config.mpp.testnet ?? false);
+
   // Hash the config values — avoids storing the raw secret as a cache key
-  const configKey = hashConfigKey(
-    config.mpp.secretKey,
-    config.mpp.tempoRecipient ?? '',
-    String(config.mpp.testnet ?? false),
-  );
+  const configKey = hashConfigKey(config.mpp.secretKey, recipient, testnet);
 
   const cached = factoryCache.get(configKey);
   if (cached) {
-    return cached;
+    // Collision check: verify the config values match (H4 fix).
+    // Even with 64-bit hash, check actual values to be safe in
+    // multi-tenant deployments where a collision = wrong recipient.
+    if (
+      cached.recipient === recipient &&
+      cached.testnet === testnet &&
+      Date.now() - cached.createdAt < FACTORY_CACHE_TTL_MS
+    ) {
+      return cached.factory;
+    }
+    // Collision or expired — evict and recreate
+    factoryCache.delete(configKey);
   }
 
   const { Mppx, tempo } = await import('mppx/server');
@@ -167,7 +213,23 @@ async function getMppChargeFactory(config: PayMuxServerConfig): Promise<ChargeFa
     return (request: Request) => handler(request) as Promise<MppChargeResult>;
   };
 
-  factoryCache.set(configKey, factory);
+  // Evict expired entries before inserting to keep cache bounded (H3 fix)
+  evictExpiredEntries();
+
+  // Enforce max cache size — evict oldest if full
+  if (factoryCache.size >= MAX_FACTORY_CACHE_SIZE) {
+    const oldestKey = factoryCache.keys().next().value;
+    if (oldestKey !== undefined) {
+      factoryCache.delete(oldestKey);
+    }
+  }
+
+  factoryCache.set(configKey, {
+    factory,
+    recipient,
+    testnet,
+    createdAt: Date.now(),
+  });
   return factory;
 }
 
@@ -192,8 +254,14 @@ export async function handleMppRequest(
   try {
     const charge = await getMppChargeFactory(config);
 
+    // M6 fix: Use toFixed(6) to avoid float precision issues like
+    // String(0.1 + 0.2) → "0.30000000000000004"
+    const amountStr = Number.isInteger(chargeOpts.amount)
+      ? String(chargeOpts.amount)
+      : chargeOpts.amount.toFixed(6).replace(/0+$/, '').replace(/\.$/, '');
+
     const result = await charge({
-      amount: String(chargeOpts.amount),
+      amount: amountStr,
       description: chargeOpts.description,
     })(request);
 

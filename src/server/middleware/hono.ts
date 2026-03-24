@@ -84,7 +84,15 @@ export function createHonoCharge(
           return;
         }
       }
-      // MPP handling failed — fall through to 402
+      // M5 fix: Include MPP error details in 402 response
+      if (mppResult.error) {
+        c.status(402);
+        return c.json({
+          error: 'Payment Required',
+          message: `MPP payment failed: ${mppResult.error}`,
+        });
+      }
+      // MPP handling failed without error details — fall through to 402
     }
 
     // x402 payment path

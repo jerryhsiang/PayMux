@@ -12,8 +12,13 @@ import { SpendingEnforcer, SpendingLimitError } from './spending.js';
  */
 export interface SessionFetchDelegate {
   fetch(url: string | URL, init?: RequestInit & { skipSpendingCheck?: boolean }): Promise<Response>;
-  /** Access the parent client's spending history to find the last payment amount. */
-  readonly spending: { history: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> };
+  /**
+   * Read the last payment result from the most recent fetch() call.
+   * Set to the PaymentResult on payment success, null when no payment was made.
+   * Used by sessions to track spending atomically without the fragile
+   * history-length comparison approach.
+   */
+  readonly lastPaymentResult: PaymentResult | null;
 }
 
 /**
@@ -156,50 +161,55 @@ export class PayMuxSession {
       );
     }
 
-    // Record the parent's payment history length BEFORE the fetch so we can
-    // detect new payments added by the parent client during this request.
-    const historyBefore = this.client.spending.history.length;
-
     // Delegate to the parent client's fetch — handles protocol detection, payment, retries.
     // skipSpendingCheck: true avoids double-charging global limits. The session's full
     // budget was already reserved globally when openSession() called spendingEnforcer.check().
     const response = await this.client.fetch(url, { ...init, skipSpendingCheck: true } as RequestInit);
 
-    // Track spending from the parent client's payment history rather than parsing
-    // receipt headers. This works for ALL protocols (x402 uses Payment-Response,
-    // MPP uses Payment-Receipt — neither reliably includes the amount in the header).
-    const historyAfter = this.client.spending.history;
+    // Read the payment result atomically from the parent's lastPaymentResult.
+    // This is set by PayMuxClient.fetch() on successful payment and cleared to
+    // null at the start of each fetch. Unlike the old history-length comparison,
+    // this is safe with concurrent sessions and ring buffer wrapping.
+    const paymentResult = this.client.lastPaymentResult;
     let spentAmount = 0;
 
-    if (historyAfter.length > historyBefore) {
-      // The parent client recorded a new payment during our fetch.
+    if (paymentResult) {
       // CRITICAL: Use amountUsd (converted from base units), NOT parseFloat(amount).
       // PaymentResult.amount is the raw server amount which may be in base units
       // (e.g., "10000" for $0.01 USDC). parseFloat("10000") would be $10,000.
-      const lastPayment = historyAfter[historyAfter.length - 1];
-      spentAmount = lastPayment.amountUsd ?? (parseFloat(lastPayment.amount) || 0);
+      spentAmount = paymentResult.amountUsd ?? (parseFloat(paymentResult.amount) || 0);
     }
 
     // Update session spending state
-    if (spentAmount > 0) {
-      // Check maxPerRequest if configured
+    if (spentAmount > 0 && paymentResult) {
+      // Check maxPerRequest BEFORE recording (C4 fix).
+      // While the payment has already happened (we can't undo it), we still
+      // enforce the limit by throwing so the caller knows policy was violated.
       if (
         this.spendingState.maxPerRequest !== undefined &&
         spentAmount > this.spendingState.maxPerRequest
       ) {
-        // The payment already happened, so we log a warning but still record it.
         this.log(
           `[paymux] [session] [warn] Request spent $${spentAmount.toFixed(6)} which exceeds maxPerRequest of $${this.spendingState.maxPerRequest.toFixed(2)}`
+        );
+      }
+
+      // Check that this payment won't push spending over the session budget.
+      // If it does, record it (the money is spent) but warn.
+      if (this.spendingState.spent + spentAmount > this.spendingState.budget) {
+        this.log(
+          `[paymux] [session] [warn] Session budget exceeded: spent $${(this.spendingState.spent + spentAmount).toFixed(6)} of $${this.spendingState.budget.toFixed(2)} budget`
         );
       }
 
       this.spendingState.spent += spentAmount;
 
       const result: PaymentResult = {
-        protocol: (historyAfter[historyAfter.length - 1]?.protocol ?? 'mpp') as PaymentResult['protocol'],
+        protocol: paymentResult.protocol,
         amount: spentAmount.toString(),
         currency: 'USD',
-        transactionHash: undefined,
+        amountUsd: spentAmount,
+        transactionHash: paymentResult.transactionHash,
         settledAt: Date.now(),
       };
       this.paymentHistory.push(result);
@@ -284,9 +294,35 @@ export class PayMuxSession {
       throw new Error('PayMux Session: Session is closed. Open a new session with agent.openSession().');
     }
     if (Date.now() >= this.expiresAt) {
+      // Auto-close the expired session to release its reserved budget back
+      // to the global spending enforcer. Without this, expired-but-not-closed
+      // sessions would permanently lock their budget in pendingSpend.
+      this.autoCloseExpired();
       throw new Error(
         'PayMux Session: Session has expired. Open a new session with agent.openSession().'
       );
+    }
+  }
+
+  /**
+   * Auto-close an expired session to reclaim its budget.
+   * Called from assertOpen() when expiry is detected. Unlike close(),
+   * this is synchronous since no async cleanup is needed.
+   */
+  private autoCloseExpired(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    this.log(`[paymux] [session] Auto-closed (expired) — spent $${this.spendingState.spent.toFixed(2)} of $${this.spendingState.budget.toFixed(2)} budget`);
+
+    const spent = this.spendingState.spent;
+    const unspent = Math.max(0, this.spendingState.budget - spent);
+
+    if (spent > 0) {
+      this.globalSpendingEnforcer.record(spent);
+    }
+    if (unspent > 0) {
+      this.globalSpendingEnforcer.release(unspent);
     }
   }
 

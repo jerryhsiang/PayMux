@@ -106,7 +106,16 @@ export function createExpressCharge(
             return;
           }
         }
-        // MPP handling failed — fall through to 402
+        // M5 fix: Include MPP error details in 402 response so the agent
+        // can understand why the payment was rejected and potentially retry.
+        if (mppResult.error) {
+          res.status(402).json({
+            error: 'Payment Required',
+            message: `MPP payment failed: ${mppResult.error}`,
+          });
+          return;
+        }
+        // MPP handling failed without error details — fall through to 402
       }
 
       // x402 payment path

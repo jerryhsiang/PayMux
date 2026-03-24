@@ -161,6 +161,15 @@ export class PayMuxServer {
             'Generate one with: crypto.randomBytes(32).toString("base64")'
         );
       }
+      // M10 fix: Validate at startup that at least one payment method is configured.
+      // Without this, the server deploys successfully but fails on the first MPP request.
+      if (!config.mpp.tempoRecipient && !config.mpp.stripeSecretKey) {
+        throw new Error(
+          'PayMux Server: MPP requires at least one payment method. ' +
+            'Pass mpp.tempoRecipient (for crypto payments via Tempo) or ' +
+            'mpp.stripeSecretKey (for card payments via Stripe).'
+        );
+      }
     }
 
     // Validate Ethereum addresses are real, not placeholders

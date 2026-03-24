@@ -4,8 +4,9 @@ import type { PayMuxLogger } from './logger.js';
 import { resolveLogger } from './logger.js';
 import { detectProtocol, selectBestRequirement } from './protocols/detector.js';
 import { X402Client } from './protocols/x402.js';
-import { MppClient } from './protocols/mpp.js';
+import { MppClient, MppTimeoutError } from './protocols/mpp.js';
 import { SpendingEnforcer } from './spending.js';
+import type { SpendingReservation } from './spending.js';
 import { verifyAmountConsistency, getTokenName } from './utils.js';
 import { probeMppAmount } from './protocols/mpp-probe.js';
 import { PayMuxSession } from './session.js';
@@ -96,6 +97,25 @@ export class PayMuxClient {
   private activeSessions: PayMuxSession[] = [];
 
   /**
+   * Last payment result from the most recent fetch() call.
+   * Used by sessions to atomically read the payment result without
+   * the fragile history-length comparison approach.
+   *
+   * Set to the PaymentResult before recordPayment() and cleared to null
+   * before each new fetch() starts. Sessions read this immediately after
+   * their delegated fetch() returns.
+   */
+  private _lastPaymentResult: PaymentResult | null = null;
+
+  /**
+   * @internal — Read the last payment result from the most recent fetch().
+   * Used by PayMuxSession to track spending without comparing history lengths.
+   */
+  get lastPaymentResult(): PaymentResult | null {
+    return this._lastPaymentResult;
+  }
+
+  /**
    * Protocol cache: maps URL origins+pathnames to detected protocols.
    *
    * Purpose: After the first probe detects that a URL speaks MPP, we cache
@@ -174,6 +194,10 @@ export class PayMuxClient {
     const urlString = url.toString();
     const options = init ?? {};
     const { maxAmount, protocol, skipPayment, skipSpendingCheck, ...fetchInit } = options;
+
+    // Clear last payment result at the start of each fetch so sessions
+    // can distinguish "no payment" from "payment" by checking lastPaymentResult.
+    this._lastPaymentResult = null;
 
     if (skipPayment) {
       return globalThis.fetch(urlString, fetchInit);
@@ -290,8 +314,9 @@ export class PayMuxClient {
     }
 
     // Per-request + per-day limits in USD (reserves amount as pending)
+    let reservation: SpendingReservation | null = null;
     if (shouldCheckSpending) {
-      this.spendingEnforcer.check(amountUsd);
+      reservation = this.spendingEnforcer.check(amountUsd);
     }
 
     // Step 5: Route to protocol client — release pending on failure
@@ -303,23 +328,35 @@ export class PayMuxClient {
       response = payResult.response;
       result = payResult.result;
     } catch (error) {
+      // On MppTimeoutError, do NOT release the pending reservation.
+      // The payment may still complete in the background.
+      if (error instanceof MppTimeoutError) {
+        this.logger.warn(
+          `[paymux] [warn] MPP payment timed out — pending reservation preserved as safeguard`,
+          { event: 'mpp_timeout_pending_preserved', amountUsd, url: urlString }
+        );
+        throw error;
+      }
       // Release the pending reservation so failed payments don't
       // permanently reduce daily spending capacity
-      if (shouldCheckSpending) {
-        this.spendingEnforcer.release(amountUsd);
+      if (reservation) {
+        this.spendingEnforcer.release(reservation);
       }
       throw error;
     }
 
     // Step 6: Record successful payment (moves from pending to confirmed)
-    if (shouldCheckSpending) {
-      this.spendingEnforcer.record(amountUsd);
+    // Use the reservation token so the exact reserved amount is released from
+    // pending. The actual amount (amountUsd) is recorded as confirmed spending.
+    if (reservation) {
+      this.spendingEnforcer.record(reservation, amountUsd);
     }
 
     // CRITICAL: Set amountUsd on the PaymentResult so downstream consumers
     // (e.g., session spending tracking) use the converted USD amount, not raw
     // base units. Without this, parseFloat("10000") would be $10,000 not $0.01.
     result.amountUsd = amountUsd;
+    this._lastPaymentResult = result;
     this.recordPayment(result);
 
     this.logger.info(
@@ -477,7 +514,10 @@ export class PayMuxClient {
     // Charge the full session budget against global spending limits upfront.
     // This ensures the agent can't circumvent daily limits by opening many sessions.
     // When the session closes, unspent budget is released back.
-    this.spendingEnforcer.check(config.budget);
+    // skipPerRequest: true — session budgets are envelopes containing many small
+    // requests, not a single payment. A $5 session with perRequest=$2 is valid
+    // because individual requests within the session will each be under $2.
+    this.spendingEnforcer.check(config.budget, /* skipPerRequest */ true);
 
     const session = new PayMuxSession(
       this,
@@ -485,6 +525,9 @@ export class PayMuxClient {
       this.spendingEnforcer
     );
 
+    // M8 fix: Clean up closed/expired sessions on each openSession call
+    // to prevent unbounded growth of the activeSessions array
+    this.activeSessions = this.activeSessions.filter(s => s.isOpen);
     this.activeSessions.push(session);
 
     this.logger.info(
@@ -550,6 +593,17 @@ export class PayMuxClient {
       this.protocolCache.delete(this.getCacheKey(url));
       // Re-fetch to return the actual non-402 response to the caller.
       // (The probe consumed the response, so we need a fresh one.)
+      // M7 fix: Only re-fetch for safe (idempotent) methods to avoid
+      // double-submitting POSTs/PUTs/DELETEs.
+      const method = (init.method ?? 'GET').toUpperCase();
+      if (method !== 'GET' && method !== 'HEAD') {
+        this.logger.warn(
+          `[paymux] [warn] Non-idempotent ${method} to cached MPP URL returned non-402. ` +
+          `The probe consumed the response. Returning a synthetic 200 to avoid double-submission.`,
+          { event: 'mpp_non_idempotent_no_payment', method, url }
+        );
+        return new Response(null, { status: 200 });
+      }
       return globalThis.fetch(url, init);
     }
 
@@ -573,8 +627,9 @@ export class PayMuxClient {
     }
 
     // Per-request + per-day limits in USD (reserves amount as pending)
+    let reservationFP: SpendingReservation | null = null;
     if (shouldCheckSpendingFP) {
-      this.spendingEnforcer.check(amountUsd);
+      reservationFP = this.spendingEnforcer.check(amountUsd);
     }
 
     // Step 3: Pay via mppx — release pending on failure
@@ -582,23 +637,44 @@ export class PayMuxClient {
     let result: PaymentResult;
 
     try {
-      const payResult = await this.mppClient.pay(url, init);
+      // Pass a minimal requirement so mppClient.pay() can populate the result
+      // with the correct amount/currency (H5 fix: without this, amount would be "0")
+      const payResult = await this.mppClient.pay(url, init, {
+        protocol: 'mpp',
+        amount: probeResult.amountRaw,
+        currency: probeResult.currency,
+        amountUsd,
+      });
       response = payResult.response;
       result = payResult.result;
     } catch (error) {
+      // On MppTimeoutError, do NOT release the pending reservation.
+      // The mppx.fetch() may still complete in the background, and releasing
+      // would make the spending invisible. The pending amount stays reserved
+      // until the daily reset as a conservative safeguard.
+      if (error instanceof MppTimeoutError) {
+        this.logger.warn(
+          `[paymux] [warn] MPP payment timed out — pending reservation of $${amountUsd.toFixed(6)} preserved as safeguard`,
+          { event: 'mpp_timeout_pending_preserved', amountUsd, url }
+        );
+        throw error;
+      }
       // Release the pending reservation so failed payments don't
       // permanently reduce daily spending capacity
-      if (shouldCheckSpendingFP) {
-        this.spendingEnforcer.release(amountUsd);
+      if (reservationFP) {
+        this.spendingEnforcer.release(reservationFP);
       }
+      // M2: Evict protocol cache on payment failure so next request
+      // does a fresh protocol detection (handles transient issues)
+      this.protocolCache.delete(this.getCacheKey(url));
       throw error;
     }
 
     // If mppx got a non-402 (server changed between our probe and mppx's probe),
     // release the pending amount since no payment was made
     if (!result.receipt) {
-      if (shouldCheckSpendingFP) {
-        this.spendingEnforcer.release(amountUsd);
+      if (reservationFP) {
+        this.spendingEnforcer.release(reservationFP);
       }
       this.logger.debug(`[paymux] [<] ${response.status} (MPP fast path — no payment on retry)`, {
         event: 'mpp_no_payment_retry', status: response.status, url,
@@ -608,14 +684,17 @@ export class PayMuxClient {
     }
 
     // Step 4: Record successful payment (moves from pending to confirmed)
-    if (shouldCheckSpendingFP) {
-      this.spendingEnforcer.record(amountUsd);
+    // Use the reservation token so the exact reserved amount is released from
+    // pending. The actual amount (amountUsd) is recorded as confirmed spending.
+    if (reservationFP) {
+      this.spendingEnforcer.record(reservationFP, amountUsd);
     }
 
     // CRITICAL: Set amountUsd on the PaymentResult so downstream consumers
     // (e.g., session spending tracking) use the converted USD amount, not raw
     // base units. Without this, parseFloat("10000") would be $10,000 not $0.01.
     result.amountUsd = amountUsd;
+    this._lastPaymentResult = result;
     this.recordPayment(result);
 
     this.logger.info(

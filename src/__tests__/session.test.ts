@@ -12,7 +12,7 @@ function createMockDelegate(mockFetch?: typeof fetch): SessionFetchDelegate {
     fetch: mockFetch ?? vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
     ),
-    spending: { history: [] },
+    lastPaymentResult: null,
   };
 }
 
@@ -48,19 +48,22 @@ describe('PayMuxSession — session management', () => {
       expect(agent.spending.pendingSpend).toBe(0);
     });
 
-    it('charges session budget against per-request limit', async () => {
+    it('allows session budget that exceeds per-request limit (H7 fix)', async () => {
       const agent = PayMux.create({
         wallet: { privateKey: TEST_KEY },
         limits: { perRequest: 2.00 },
       });
 
-      // Session budget of $5.00 exceeds per-request limit of $2.00
-      await expect(
-        agent.openSession({
-          url: 'https://api.example.com',
-          budget: 5.00,
-        })
-      ).rejects.toThrow(SpendingLimitError);
+      // Session budget of $5.00 exceeds per-request limit of $2.00, but session
+      // budgets are envelopes (not single requests) so perRequest is skipped.
+      // Individual requests within the session will each be checked against perRequest.
+      const session = await agent.openSession({
+        url: 'https://api.example.com',
+        budget: 5.00,
+      });
+      expect(session).toBeInstanceOf(PayMuxSession);
+      expect(session.isOpen).toBe(true);
+      await session.close();
     });
 
     it('successfully opens a session when budget is within limits', async () => {

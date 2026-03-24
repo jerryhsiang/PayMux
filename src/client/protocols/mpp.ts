@@ -84,13 +84,20 @@ export class MppClient {
     // Timeout: mppx.fetch is a wrapped fetch that may not support AbortSignal,
     // so we use Promise.race to enforce a hard timeout. If the Tempo chain or
     // the mppx server hangs, the agent won't block indefinitely.
+    //
+    // IMPORTANT: On timeout, mppx.fetch continues in the background. The payment
+    // may still succeed. The caller (PayMuxClient) should NOT release the spending
+    // reservation on MppTimeoutError — the pending amount stays reserved until the
+    // daily reset as a conservative safeguard against untracked spending.
     const timeoutMs = this.paymentTimeoutMs;
     const response = await Promise.race([
       this.mppxFetch(url, init),
       new Promise<never>((_, reject) =>
         setTimeout(
-          () => reject(new Error(
-            `PayMux: MPP payment timed out after ${timeoutMs}ms. The Tempo chain may be unreachable.`
+          () => reject(new MppTimeoutError(
+            `PayMux: MPP payment timed out after ${timeoutMs}ms. The Tempo chain may be unreachable. ` +
+            `Note: The payment may still complete in the background. The pending spending reservation ` +
+            `is preserved as a safeguard.`
           )),
           timeoutMs,
         )
@@ -147,5 +154,20 @@ export class MppClient {
     if (requirement.protocol !== 'mpp') return false;
     if (!this.walletConfig.privateKey) return false;
     return true;
+  }
+}
+
+/**
+ * Error thrown when an MPP payment times out.
+ *
+ * Unlike a regular timeout error, this signals that the underlying mppx.fetch()
+ * may still complete in the background (payment may have been sent). Callers
+ * should NOT release the spending reservation when catching this error — the
+ * pending amount is preserved as a conservative safeguard.
+ */
+export class MppTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MppTimeoutError';
   }
 }

@@ -519,7 +519,7 @@ describe('PayMux client', () => {
         fetch: mockFetch ?? vi.fn().mockResolvedValue(
           new Response(JSON.stringify({ data: 'ok' }), { status: 200 })
         ),
-        spending: { history: [] },
+        lastPaymentResult: null,
       };
       return new PayMuxSession(delegate, config, spendingEnforcer);
     }
@@ -600,21 +600,17 @@ describe('PayMux client', () => {
       await expect(session.fetch('/data')).rejects.toThrow('Session budget exhausted');
     });
 
-    it('session budget enforcement — tracks spending from parent history', async () => {
-      // The session now tracks spending from the parent client's payment history,
-      // not from receipt headers. This works for both x402 and MPP protocols.
-      const parentHistory: Array<{ amount: string; amountUsd?: number; protocol: string; settledAt?: number }> = [];
-
-      const mockFetch = vi.fn().mockImplementation(async () => {
-        // Simulate the parent client recording a payment during fetch
-        parentHistory.push({ amount: '0.02', amountUsd: 0.02, protocol: 'mpp', settledAt: Date.now() });
-        return new Response(JSON.stringify({ result: 'ok' }), { status: 200 });
-      });
-
+    it('session budget enforcement — tracks spending from parent lastPaymentResult', async () => {
+      // The session tracks spending from the parent client's lastPaymentResult.
       const spendingEnforcer = new SpendingEnforcer({});
       const delegate: SessionFetchDelegate = {
-        fetch: mockFetch,
-        spending: { history: parentHistory },
+        fetch: vi.fn().mockImplementation(async () => {
+          delegate.lastPaymentResult = {
+            protocol: 'mpp', amount: '0.02', currency: 'USD', amountUsd: 0.02, settledAt: Date.now(),
+          };
+          return new Response(JSON.stringify({ result: 'ok' }), { status: 200 });
+        }),
+        lastPaymentResult: null,
       };
       const session = new PayMuxSession(
         delegate,
